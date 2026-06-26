@@ -2,9 +2,8 @@ name: screen
 
 on:
   schedule:
-    # 日〜木 23:00 UTC = 月〜金 08:00 JST（寄り前）
     - cron: "0 23 * * 0-4"
-  workflow_dispatch: {}   # 手動実行ボタン
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -24,8 +23,7 @@ jobs:
 
       - name: Run screener
         env:
-          JQUANTS_MAILADDRESS: ${{ secrets.JQUANTS_MAILADDRESS }}
-          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
         run: python screener.py
 
       - name: Commit results
