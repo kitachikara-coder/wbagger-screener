@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-wbagger-screener : J-Quants ベースの初動スクリーニング
-- 認証 (mailaddress/password -> refreshToken -> idToken)
+wbagger-screener : J-Quants API v2 ベースの初動スクリーニング
+- 認証: APIキー方式（x-api-key ヘッダ。ダッシュボードで発行）
 - 前営業日終値ベースで東証グロースの初動候補を抽出
 - docs/data/latest.json と docs/index.html を生成
 本処理は GitHub Actions 上で動かす想定。ローカル実行も可。
 
-注意:
-- J-Quants の正確なフィールド名/挙動は公式 API リファレンスで要確認。
-  本コードは v1 想定で防御的に実装(欠損は None 扱いで停止しない)。
-- 投資助言ではない。最終判断は自己責任。
+J-Quants v2 仕様（要点）:
+- Base: https://api.jquants.com/v2
+- レスポンスは {"data":[...], "pagination_key":...}
+- 株価 /equities/bars/daily : Date,Code,O,H,L,C,UL,LL,Vo,Va,AdjC,AdjVo ...
+- 銘柄 /equities/master      : Code,CoName,MktNm(例 "グロース") ...
+- 財務 /fins/summary         : CurPerType,Sales,OP,NP,TA,Eq,EqAR(小数),CFO,FOP,ShOutFY,TrShFY ...
+- 信用 /markets/margin-interest（列名未確認のため防御的に取得）
+
+投資助言ではない。最終判断は自己責任。
 """
 
 import os
@@ -27,24 +32,21 @@ try:
 except ImportError:
     yaml = None
 
-API_BASE = "https://api.jquants.com/v1"
+API_BASE = "https://api.jquants.com/v2"
 JST = dt.timezone(dt.timedelta(hours=9))
 
-# ----------------------------------------------------------------------
-# 設定読み込み
-# ----------------------------------------------------------------------
 DEFAULT_CRITERIA = {
-    "market_name": "グロース",          # listed/info の MarketCodeName で絞り込み
-    "market_cap_oku_min": 10,           # 時価総額 下限(億円)
-    "market_cap_oku_max": 300,          # 時価総額 上限(億円)
-    "change_pct_min": 5.0,              # 一次絞り込み: 前日比 +%以上 を候補に
-    "volume_spike_min": 3.0,            # 出来高 = 過去20日平均の何倍以上
-    "op_margin_min": 0.13,              # 営業利益率 下限
-    "equity_ratio_min": 40.0,           # 自己資本比率 下限(%)
-    "roe_min": 8.0,                     # ROE 下限(%)
-    "ma_avg_window": 20,                # 出来高平均の期間
-    "taboo_equity_ratio_max": 30.0,     # タブー: 自己資本比率 <= これ
-    "margin_long_k_max": 1000,          # 信用買残 これ(千株)以下を「少」とみなす目安
+    "market_name": "グロース",
+    "market_cap_oku_min": 10,
+    "market_cap_oku_max": 300,
+    "change_pct_min": 5.0,
+    "volume_spike_min": 3.0,
+    "op_margin_min": 0.13,
+    "equity_ratio_min": 40.0,
+    "roe_min": 8.0,
+    "ma_avg_window": 20,
+    "taboo_equity_ratio_max": 30.0,
+    "margin_long_k_max": 1000,
 }
 
 
@@ -54,53 +56,36 @@ def load_criteria() -> Dict[str, Any]:
     if yaml and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                user = yaml.safe_load(f) or {}
-            crit.update(user)
+                crit.update(yaml.safe_load(f) or {})
         except Exception as e:
             print(f"[warn] criteria.yaml 読み込み失敗: {e}")
     return crit
 
 
 # ----------------------------------------------------------------------
-# J-Quants クライアント
+# J-Quants v2 クライアント（APIキー方式）
 # ----------------------------------------------------------------------
 class JQuants:
-    def __init__(self, mail: str, password: str):
+    def __init__(self, api_key: str, min_interval: float = 1.05):
         self.session = requests.Session()
-        self.id_token = self._auth(mail, password)
+        self.api_key = api_key
+        self.min_interval = min_interval   # Light=60req/min → 約1.05秒/req
+        self._last = 0.0
 
-    def _auth(self, mail: str, password: str) -> str:
-        # 1) refreshToken
-        r = self.session.post(
-            f"{API_BASE}/token/auth_user",
-            data=json.dumps({"mailaddress": mail, "password": password}),
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        refresh = r.json().get("refreshToken")
-        if not refresh:
-            raise RuntimeError("refreshToken を取得できません(認証情報を確認)")
-        # 2) idToken
-        r2 = self.session.post(
-            f"{API_BASE}/token/auth_refresh",
-            params={"refreshtoken": refresh},
-            timeout=30,
-        )
-        r2.raise_for_status()
-        idt = r2.json().get("idToken")
-        if not idt:
-            raise RuntimeError("idToken を取得できません")
-        print("[ok] J-Quants 認証成功")
-        return idt
+    def _throttle(self):
+        gap = time.time() - self._last
+        if gap < self.min_interval:
+            time.sleep(self.min_interval - gap)
+        self._last = time.time()
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None,
-            data_key: Optional[str] = None) -> List[Dict[str, Any]]:
-        """pagination_key を辿って全件取得。data_key のリストを返す。"""
+            data_key: str = "data") -> List[Dict[str, Any]]:
         params = dict(params or {})
-        headers = {"Authorization": f"Bearer {self.id_token}"}
+        headers = {"x-api-key": self.api_key}
         out: List[Dict[str, Any]] = []
-        for _ in range(50):  # 安全のための上限
+        for _ in range(200):
+            self._throttle()
+            resp = None
             for attempt in range(4):
                 resp = self.session.get(f"{API_BASE}{path}", params=params,
                                         headers=headers, timeout=60)
@@ -113,12 +98,7 @@ class JQuants:
             else:
                 resp.raise_for_status()
             body = resp.json()
-            if data_key is None:
-                # data_key 自動判定: pagination_key 以外の最初のリスト
-                data_key = next((k for k, v in body.items()
-                                 if isinstance(v, list)), None)
-            if data_key:
-                out.extend(body.get(data_key, []))
+            out.extend(body.get(data_key, []) or [])
             pk = body.get("pagination_key")
             if not pk:
                 break
@@ -155,13 +135,11 @@ def ema(values: List[float], n: int) -> Optional[float]:
 
 
 def macd_cross_up(closes: List[float]) -> Optional[bool]:
-    """MACD がシグナルを上抜けている状態か(好転)。"""
     if len(closes) < 35:
         return None
     macd_line = []
     for i in range(26, len(closes) + 1):
-        sub = closes[:i]
-        e12, e26 = ema(sub, 12), ema(sub, 26)
+        e12, e26 = ema(closes[:i], 12), ema(closes[:i], 26)
         if e12 is None or e26 is None:
             continue
         macd_line.append(e12 - e26)
@@ -174,23 +152,23 @@ def macd_cross_up(closes: List[float]) -> Optional[bool]:
 
 
 def disp_code(code: str) -> str:
-    """J-Quants の5桁内部コードを表示用に。"""
     if len(code) == 5 and code.endswith("0"):
         return code[:4]
     return code
 
 
 # ----------------------------------------------------------------------
-# データ取得段階
+# データ取得
 # ----------------------------------------------------------------------
-def latest_trading_date(jq: JQuants, max_back: int = 7) -> Optional[str]:
-    """前営業日から遡って、daily_quotes が返る最新日を探す。"""
+def bars_by_date(jq: JQuants, date_str: str) -> List[Dict[str, Any]]:
+    return jq.get("/equities/bars/daily", {"date": date_str})
+
+
+def latest_trading_date(jq: JQuants, max_back: int = 8) -> Optional[str]:
     today = dt.datetime.now(JST).date()
     for i in range(1, max_back + 2):
-        d = today - dt.timedelta(days=i)
-        ds = d.strftime("%Y-%m-%d")
-        rows = jq.get("/prices/daily_quotes", {"date": ds}, "daily_quotes")
-        if rows:
+        ds = (today - dt.timedelta(days=i)).strftime("%Y-%m-%d")
+        if bars_by_date(jq, ds):
             return ds
     return None
 
@@ -198,62 +176,53 @@ def latest_trading_date(jq: JQuants, max_back: int = 7) -> Optional[str]:
 def prev_trading_date(jq: JQuants, base: str) -> Optional[str]:
     b = dt.datetime.strptime(base, "%Y-%m-%d").date()
     for i in range(1, 9):
-        d = b - dt.timedelta(days=i)
-        ds = d.strftime("%Y-%m-%d")
-        rows = jq.get("/prices/daily_quotes", {"date": ds}, "daily_quotes")
-        if rows:
+        ds = (b - dt.timedelta(days=i)).strftime("%Y-%m-%d")
+        if bars_by_date(jq, ds):
             return ds
     return None
 
 
-def build_universe(jq: JQuants, target: str, prev: str,
-                   growth_codes: set) -> List[Dict[str, Any]]:
-    """対象日の全銘柄から、東証グロースかつ値上がり/ S高 の一次候補を返す。"""
-    cur = {r["Code"]: r for r in jq.get("/prices/daily_quotes",
-                                        {"date": target}, "daily_quotes")}
-    prv = {r["Code"]: r for r in jq.get("/prices/daily_quotes",
-                                        {"date": prev}, "daily_quotes")}
-    crit = load_criteria()
-    shortlist = []
-    for code, row in cur.items():
-        if growth_codes and code not in growth_codes:
-            continue
-        close = fnum(row.get("Close"))
-        pclose = fnum(prv.get(code, {}).get("Close"))
-        if close is None or pclose is None or pclose == 0:
-            continue
-        change = (close - pclose) / pclose * 100
-        stop_high = str(row.get("UpperLimit")) == "1"
-        if change >= crit["change_pct_min"] or stop_high:
-            shortlist.append({
-                "code": code, "close": close, "change_pct": round(change, 2),
-                "stop_high": stop_high, "volume": fnum(row.get("Volume")),
-            })
-    print(f"[ok] 一次候補(グロース・値上がり/S高): {len(shortlist)}件")
-    return shortlist
-
-
 def growth_universe(jq: JQuants, target: str, market_name: str):
-    """listed/info から東証グロースのコード集合と名称辞書を返す。"""
-    info = jq.get("/listed/info", {"date": target}, "info")
+    info = jq.get("/equities/master", {"date": target})
     if not info:
-        info = jq.get("/listed/info", None, "info")
+        info = jq.get("/equities/master")
     codes, names = set(), {}
     for r in info:
-        mkt = r.get("MarketCodeName") or r.get("MarketCode") or ""
-        names[r["Code"]] = r.get("CompanyName", "")
-        if market_name in str(mkt):
+        names[r["Code"]] = r.get("CoName", "")
+        if market_name in str(r.get("MktNm", "")):
             codes.add(r["Code"])
     print(f"[ok] 東証{market_name} 銘柄数: {len(codes)}")
     return codes, names
 
 
-def latest_fy_statement(stmts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    fy = [s for s in stmts
-          if str(s.get("TypeOfCurrentPeriod", "")).upper() == "FY"]
-    if not fy:
-        return stmts[-1] if stmts else None
-    return sorted(fy, key=lambda s: s.get("DisclosedDate", ""))[-1]
+def build_shortlist(jq: JQuants, target: str, prev: str, growth_codes: set,
+                    crit: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cur = {r["Code"]: r for r in bars_by_date(jq, target)}
+    prv = {r["Code"]: r for r in bars_by_date(jq, prev)}
+    shortlist = []
+    for code, row in cur.items():
+        if growth_codes and code not in growth_codes:
+            continue
+        close = fnum(row.get("C"))
+        pclose = fnum(prv.get(code, {}).get("C"))
+        if close is None or pclose in (None, 0):
+            continue
+        change = (close - pclose) / pclose * 100
+        stop_high = str(row.get("UL")) == "1"
+        if change >= crit["change_pct_min"] or stop_high:
+            shortlist.append({
+                "code": code, "close": close,
+                "change_pct": round(change, 2),
+                "stop_high": stop_high, "volume": fnum(row.get("Vo")),
+            })
+    print(f"[ok] 一次候補(グロース・値上がり/S高): {len(shortlist)}件")
+    return shortlist
+
+
+def fy_rows(stmts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    fy = [s for s in stmts if str(s.get("CurPerType", "")).upper() == "FY"]
+    fy.sort(key=lambda s: s.get("DiscDate", ""))
+    return fy
 
 
 def analyze_candidate(jq: JQuants, item: Dict[str, Any],
@@ -268,87 +237,94 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any],
         "ma_perfect_order": None, "macd_cross": None,
         "op_margin": None, "equity_ratio": None, "roe": None,
         "profit_trend": None, "taboo_hit": None, "taboo_reason": "",
-        "margin_long_k": None, "stop_loss": None,
-        "manual_note": "",
+        "margin_long_k": None, "stop_loss": None, "manual_note": "",
     }
 
-    # --- 株価履歴: MA / MACD / 出来高倍率 ---
-    hist = jq.get("/prices/daily_quotes", {"code": code}, "daily_quotes")
-    hist = [h for h in hist if fnum(h.get("Close")) is not None]
+    # --- 株価履歴(直近約1.5年): MA / MACD / 出来高倍率 ---
+    frm = (dt.datetime.strptime(item.get("date_target", dt.datetime.now(JST)
+            .strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+           - dt.timedelta(days=400)).strftime("%Y-%m-%d")
+    hist = jq.get("/equities/bars/daily", {"code": code, "from": frm,
+                  "to": item.get("date_target")})
+    hist = [h for h in hist if fnum(h.get("C")) is not None]
     hist.sort(key=lambda h: h.get("Date", ""))
-    closes = [fnum(h.get("Close")) for h in hist]
-    vols = [fnum(h.get("Volume")) or 0 for h in hist]
+    closes = [fnum(h.get("C")) for h in hist]
+    vols = [fnum(h.get("Vo")) or 0 for h in hist]
     if len(closes) >= 5:
         ma5, ma25 = sma(closes, 5), sma(closes, 25)
         ma75, ma200 = sma(closes, 75), sma(closes, 200)
         price = closes[-1]
         if None not in (ma5, ma25, ma75, ma200):
-            rec["ma_perfect_order"] = (price > ma5 > ma25 > ma75 > ma200)
-        if ma25:
-            rec["stop_loss"] = round(min(closes[-5:]))  # 直近5日安値を逆指値目安
+            rec["ma_perfect_order"] = price > ma5 > ma25 > ma75 > ma200
+        rec["stop_loss"] = round(min(closes[-5:]))
         rec["macd_cross"] = macd_cross_up(closes)
     if len(vols) > crit["ma_avg_window"]:
         base = sum(vols[-(crit["ma_avg_window"] + 1):-1]) / crit["ma_avg_window"]
         if base > 0 and vols[-1]:
             rec["volume_x"] = round(vols[-1] / base, 1)
 
-    # --- 財務: 利益率 / 自己資本比率 / ROE / 増益 / タブー / 時価総額 ---
-    stmts = jq.get("/fins/statements", {"code": code}, "statements")
-    st = latest_fy_statement(stmts)
+    # --- 財務サマリ ---
+    stmts = jq.get("/fins/summary", {"code": code})
+    fy = fy_rows(stmts)
+    st = fy[-1] if fy else (stmts[-1] if stmts else None)
     if st:
-        sales = fnum(st.get("NetSales"))
-        op = fnum(st.get("OperatingProfit"))
-        profit = fnum(st.get("Profit"))
-        equity = fnum(st.get("Equity"))
-        er = fnum(st.get("EquityToAssetRatio"))
-        if er is not None and er < 1.5:  # 比率が小数(0-1)で来る場合に%へ
-            er *= 100
-        f_op = fnum(st.get("ForecastOperatingProfit"))
-        shares = fnum(st.get(
-            "NumberOfIssuedAndOutstandingSharesAtTheEndOfFiscalYearIncludingTreasuryStock"))
-        treasury = fnum(st.get("NumberOfTreasuryStockAtTheEndOfFiscalYear")) or 0
+        sales = fnum(st.get("Sales"))
+        op = fnum(st.get("OP"))
+        np_ = fnum(st.get("NP"))
+        eq = fnum(st.get("Eq"))
+        eqar = fnum(st.get("EqAR"))
+        if eqar is not None:
+            eqar *= 100  # v2 EqAR は小数比率
+        f_op = fnum(st.get("FOP"))
+        shares = fnum(st.get("ShOutFY"))
+        treasury = fnum(st.get("TrShFY")) or 0
 
         if sales and op is not None:
             rec["op_margin"] = round(op / sales, 3)
-        if er is not None:
-            rec["equity_ratio"] = round(er, 1)
-        if equity and profit is not None and equity != 0:
-            rec["roe"] = round(profit / equity * 100, 1)
-        if f_op is not None and op is not None:
+        if eqar is not None:
+            rec["equity_ratio"] = round(eqar, 1)
+        if eq and np_ is not None and eq != 0:
+            rec["roe"] = round(np_ / eq * 100, 1)
+        # 増益: 直近FYのOPが前FYより増加、無ければ予想FOP>OP
+        ops = [fnum(r.get("OP")) for r in fy if fnum(r.get("OP")) is not None]
+        if len(ops) >= 2:
+            rec["profit_trend"] = "増益" if ops[-1] > ops[-2] else "減益/横ばい"
+        elif f_op is not None and op is not None:
             rec["profit_trend"] = "増益" if f_op > op else "減益/横ばい"
         if shares:
-            net_shares = shares - treasury
-            rec["market_cap_oku"] = round(item["close"] * net_shares / 1e8, 1)
+            rec["market_cap_oku"] = round(item["close"] * (shares - treasury) / 1e8, 1)
 
-        # タブー判定
+        # タブー
         reasons = []
         if rec["equity_ratio"] is not None and \
                 rec["equity_ratio"] <= crit["taboo_equity_ratio_max"]:
             reasons.append(f"自己資本比率{rec['equity_ratio']}%≤{crit['taboo_equity_ratio_max']}%")
-        cfs = [fnum(s.get("CashFlowsFromOperatingActivities"))
-               for s in stmts
-               if str(s.get("TypeOfCurrentPeriod", "")).upper() == "FY"]
-        cfs = [c for c in cfs if c is not None][-3:]
+        cfs = [fnum(r.get("CFO")) for r in fy if fnum(r.get("CFO")) is not None][-3:]
         if len(cfs) == 3 and all(c < 0 for c in cfs):
             reasons.append("営業CF3期連続マイナス")
         rec["taboo_hit"] = len(reasons) > 0
         rec["taboo_reason"] = " / ".join(reasons)
 
-    # --- 信用残(週次) ---
-    mgn = jq.get("/markets/weekly_margin_interest", {"code": code},
-                 "weekly_margin_interest")
-    if mgn:
-        mgn.sort(key=lambda m: m.get("Date", ""))
-        longv = fnum(mgn[-1].get("LongMarginTradeVolume"))
-        if longv is not None:
-            rec["margin_long_k"] = round(longv / 1000, 1)
+    # --- 信用残(列名未確認のため防御的) ---
+    try:
+        mgn = jq.get("/markets/margin-interest", {"code": code})
+        if mgn:
+            mgn.sort(key=lambda m: m.get("Date", ""))
+            last = mgn[-1]
+            longv = None
+            for key in ("LongMarginTradeVolume", "LongVo", "Long",
+                        "LongMargin", "LMgn"):
+                if key in last:
+                    longv = fnum(last.get(key))
+                    break
+            if longv is not None:
+                rec["margin_long_k"] = round(longv / 1000, 1)
+    except Exception:
+        pass
 
     return rec
 
 
-# ----------------------------------------------------------------------
-# ラベリング
-# ----------------------------------------------------------------------
 def label(rec: Dict[str, Any], crit: Dict[str, Any]) -> str:
     if rec.get("taboo_hit"):
         return "除外"
@@ -386,6 +362,9 @@ def render(target: str, records: List[Dict[str, Any]]):
     for r in records:
         def cell(v, suf=""):
             return "—" if v is None else f"{v}{suf}"
+
+        def tri(v):
+            return "○" if v else ("—" if v is None else "×")
         rows.append(f"""<tr class="lab-{order.get(r['label'],9)}">
 <td>{r['label']}</td><td>{r['code']}</td><td>{r['name']}</td>
 <td class="num">{cell(r.get('change_pct'),'%')}</td>
@@ -394,8 +373,8 @@ def render(target: str, records: List[Dict[str, Any]]):
 <td class="num">{cell(r.get('market_cap_oku'),'億')}</td>
 <td class="num">{cell(r.get('equity_ratio'),'%')}</td>
 <td>{cell(r.get('profit_trend'))}</td>
-<td>{'○' if r.get('ma_perfect_order') else '—' if r.get('ma_perfect_order') is None else '×'}</td>
-<td>{'○' if r.get('macd_cross') else '—' if r.get('macd_cross') is None else '×'}</td>
+<td>{tri(r.get('ma_perfect_order'))}</td>
+<td>{tri(r.get('macd_cross'))}</td>
 <td class="num">{cell(r.get('margin_long_k'),'千')}</td>
 <td class="num">{cell(r.get('stop_loss'))}</td>
 <td class="warn">{r.get('taboo_reason','')}</td>
@@ -434,17 +413,16 @@ P.O.=パーフェクトオーダー。「—」はデータ取得不可。材料
 # メイン
 # ----------------------------------------------------------------------
 def main() -> int:
-    mail = os.environ.get("JQUANTS_MAILADDRESS")
-    pw = os.environ.get("JQUANTS_PASSWORD")
-    if not mail or not pw:
-        print("[error] 環境変数 JQUANTS_MAILADDRESS / JQUANTS_PASSWORD が未設定")
+    api_key = os.environ.get("JQUANTS_API_KEY")
+    if not api_key:
+        print("[error] 環境変数 JQUANTS_API_KEY が未設定（J-Quants v2 はAPIキー方式）")
         return 1
     crit = load_criteria()
-    jq = JQuants(mail, pw)
+    jq = JQuants(api_key)
 
     target = latest_trading_date(jq)
     if not target:
-        print("[error] 取引日データが見つかりません(プランの配信遅延を確認)")
+        print("[error] 取引日データが見つかりません(プランの配信状況/APIキーを確認)")
         return 1
     prev = prev_trading_date(jq, target)
     if not prev:
@@ -453,7 +431,9 @@ def main() -> int:
     print(f"[ok] 対象日={target} / 前日={prev}")
 
     growth_codes, names = growth_universe(jq, target, crit["market_name"])
-    shortlist = build_universe(jq, target, prev, growth_codes)
+    shortlist = build_shortlist(jq, target, prev, growth_codes, crit)
+    for it in shortlist:
+        it["date_target"] = target
 
     records = []
     for i, item in enumerate(shortlist, 1):
