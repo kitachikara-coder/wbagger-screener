@@ -1,0 +1,12 @@
+# スクリーニング閾値（変更したらここを編集）
+market_name: "グロース"        # 対象市場（listed/info の MarketCodeName 部分一致）
+market_cap_oku_min: 10          # 時価総額 下限(億円)
+market_cap_oku_max: 300         # 時価総額 上限(億円)  ※テンバガー標準は 20-100
+change_pct_min: 5.0             # 一次絞り込み: 前日比 +%以上を候補に
+volume_spike_min: 3.0           # 出来高 = 過去20日平均の何倍以上で「急増」
+op_margin_min: 0.13            # 営業利益率 下限（13%）
+equity_ratio_min: 40.0         # 自己資本比率 下限(%)
+roe_min: 8.0                   # ROE 下限(%)
+ma_avg_window: 20              # 出来高平均の期間（日）
+taboo_equity_ratio_max: 30.0   # タブー: 自己資本比率 これ以下
+margin_long_k_max: 1000        # 信用買残 これ(千株)以下を「少」とみなす目安
