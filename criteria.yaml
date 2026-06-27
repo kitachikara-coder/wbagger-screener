@@ -1,5 +1,5 @@
 # スクリーニング閾値（変更したらここを編集）
-market_name: "グロース"        # 対象市場（listed/info の MarketCodeName 部分一致）
+markets: ["グロース", "スタンダード"]   # 対象市場（master の MktNm 部分一致。プライムを含めるなら追加）
 market_cap_oku_min: 10          # 時価総額 下限(億円)
 market_cap_oku_max: 300         # 時価総額 上限(億円)  ※テンバガー標準は 20-100
 change_pct_min: 5.0             # 一次絞り込み: 前日比 +%以上を候補に
