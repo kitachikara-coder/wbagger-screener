@@ -259,12 +259,12 @@ def fy_rows(stmts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return fy
 
 
-def build_chart(dates, opens, highs, lows, closes) -> List[Dict[str, Any]]:
+def build_series(dates, opens, highs, lows, closes, npoints=CHART_POINTS) -> List[Dict[str, Any]]:
     ma5, ma25, ma75 = sma_series(closes, 5), sma_series(closes, 25), sma_series(closes, 75)
     macd, sig, hist = macd_series(closes)
     rci9, rci26 = rci_series(closes, 9), rci_series(closes, 26)
     n = len(closes)
-    start = max(0, n - CHART_POINTS)
+    start = max(0, n - npoints)
     out = []
     for i in range(start, n):
         dlabel = dates[i][5:].replace("-", "/") if dates[i] else ""
@@ -275,6 +275,36 @@ def build_chart(dates, opens, highs, lows, closes) -> List[Dict[str, Any]]:
                     "macd": r2(macd[i], 2), "sig": r2(sig[i], 2), "hist": r2(hist[i], 2),
                     "rci9": r2(rci9[i], 1), "rci26": r2(rci26[i], 1)})
     return out
+
+
+def resample_weekly(dates, opens, highs, lows, closes):
+    """日足を週足OHLCに再集計（ISO週）。"""
+    wd, wo, wh, wl, wc = [], [], [], [], []
+    cur = None
+    bo = bh = bl = bc = bdate = None
+    for i, ds in enumerate(dates):
+        if not ds:
+            continue
+        y, wk, _ = dt.date.fromisoformat(ds).isocalendar()
+        key = (y, wk)
+        if key != cur:
+            if cur is not None:
+                wd.append(bdate); wo.append(bo); wh.append(bh); wl.append(bl); wc.append(bc)
+            cur = key
+            bo, bh, bl, bc, bdate = opens[i], highs[i], lows[i], closes[i], ds
+        else:
+            if highs[i] is not None:
+                bh = highs[i] if bh is None else max(bh, highs[i])
+            if lows[i] is not None:
+                bl = lows[i] if bl is None else min(bl, lows[i])
+            if closes[i] is not None:
+                bc = closes[i]
+            if bo is None:
+                bo = opens[i]
+            bdate = ds
+    if cur is not None:
+        wd.append(bdate); wo.append(bo); wh.append(bh); wl.append(bl); wc.append(bc)
+    return wd, wo, wh, wl, wc
 
 
 def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
@@ -294,7 +324,7 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
     }
 
     frm = (dt.datetime.strptime(item["date_target"], "%Y-%m-%d").date()
-           - dt.timedelta(days=400)).strftime("%Y-%m-%d")
+           - dt.timedelta(days=760)).strftime("%Y-%m-%d")
     hist = jq.get("/equities/bars/daily",
                   {"code": code, "from": frm, "to": item["date_target"]})
     hist = [h for h in hist if fnum(h.get("AdjC")) is not None]
@@ -315,7 +345,9 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         macd, sig, _ = macd_series(closes)
         if macd[-1] is not None and sig[-1] is not None:
             rec["macd_cross"] = macd[-1] > sig[-1]
-        rec["chart"] = build_chart(dates, opens, highs, lows, closes)
+        wd, wo, wh, wl, wc = resample_weekly(dates, opens, highs, lows, closes)
+        rec["chart"] = {"d": build_series(dates, opens, highs, lows, closes),
+                        "w": build_series(wd, wo, wh, wl, wc)}
     if len(vols) > crit["ma_avg_window"]:
         base = sum(vols[-(crit["ma_avg_window"] + 1):-1]) / crit["ma_avg_window"]
         if base > 0 and vols[-1]:
@@ -444,6 +476,8 @@ tr.lab-0{{background:#13301f}} tr.lab-1{{background:#1b2433}} tr.lab-3{{opacity:
 .note{{color:#8b949e;font-size:12px;margin-top:14px;line-height:1.6}}
 #panel{{display:none;margin:16px 0;padding:12px;border:1px solid #30363d;border-radius:8px;background:#0f141b}}
 #panel h2{{font-size:15px;margin:.2em 0 .6em}}
+#tfbtns{{margin-bottom:8px}}
+#tfbtns button{{background:#21262d;color:#e6edf3;border:1px solid #30363d;padding:4px 14px;margin-right:6px;border-radius:6px;cursor:pointer;font-size:12px}}
 .cwrap{{position:relative;height:220px;margin-bottom:10px}}
 .cwrap.small{{height:140px}}
 .close{{float:right;color:#8b949e;cursor:pointer}}
@@ -454,6 +488,7 @@ tr.lab-0{{background:#13301f}} tr.lab-1{{background:#1b2433}} tr.lab-3{{opacity:
 <div id="panel">
   <span class="close" onclick="document.getElementById('panel').style.display='none'">閉じる ✕</span>
   <h2 id="ptitle"></h2>
+  <div id="tfbtns"><button id="btf-d" onclick="setTf('d')">日足</button><button id="btf-w" onclick="setTf('w')">週足</button></div>
   <div class="cwrap"><canvas id="cPrice"></canvas></div>
   <div class="cwrap small"><canvas id="cMacd"></canvas></div>
   <div class="cwrap small"><canvas id="cRci"></canvas></div>
@@ -482,20 +517,29 @@ function line(label, key, rows, color, opt) {{
   return Object.assign({{type:'line', label, data: rows.map(r=>r[key]), borderColor: color,
     borderWidth: 1.4, pointRadius: 0, tension: .15, spanGaps: true}}, opt||{{}});
 }}
-function showChart(code) {{
+let curCode = null, curTf = 'd';
+function updateTfBtns() {{
+  ['d','w'].forEach(t=>{{ const b=document.getElementById('btf-'+t);
+    if(b) b.style.background = (t===curTf ? '#1f6feb' : '#21262d'); }});
+}}
+function setTf(tf) {{ if(curCode) showChart(curCode, tf); }}
+function showChart(code, tf) {{
   const d = DATA[code];
+  curCode = code; curTf = (tf || 'd'); updateTfBtns();
   charts.forEach(c=>c.destroy()); charts = [];
   const panel = document.getElementById('panel'); panel.style.display = 'block';
   panel.scrollIntoView({{behavior:'smooth',block:'start'}});
-  if (!d || !d.chart || !d.chart.length) {{
+  const series = (d && d.chart) ? d.chart[curTf] : null;
+  if (!d || !series || !series.length) {{
     document.getElementById('ptitle').textContent =
       (d ? d.code + ' ' + d.name : code) + ' — チャートデータ不足（新規上場等）';
     return;
   }}
-  const rows = d.chart, labels = rows.map(r=>r.d);
+  const rows = series, labels = rows.map(r=>r.d);
+  const tfName = (curTf==='w' ? '週足' : '日足');
   const lastC = rows[rows.length-1].c, lastD = rows[rows.length-1].d;
   document.getElementById('ptitle').textContent =
-    d.code + ' ' + d.name + '　終値 ¥' + lastC + '（' + lastD + '）';
+    d.code + ' ' + d.name + '　[' + tfName + ']　終値 ¥' + lastC + '（' + lastD + '）';
   const grid = {{color:'#222',drawTicks:false}}, tick={{color:'#8b949e',maxTicksLimit:8,font:{{size:9}}}};
   const up='#3fb950', dn='#f85149';
   const wick={{type:'bar',label:'wick',data:rows.map(r=>(r.l!=null&&r.h!=null)?[r.l,r.h]:null),
