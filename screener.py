@@ -259,7 +259,7 @@ def fy_rows(stmts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return fy
 
 
-def build_chart(dates: List[str], closes: List[float]) -> List[Dict[str, Any]]:
+def build_chart(dates, opens, highs, lows, closes) -> List[Dict[str, Any]]:
     ma5, ma25, ma75 = sma_series(closes, 5), sma_series(closes, 25), sma_series(closes, 75)
     macd, sig, hist = macd_series(closes)
     rci9, rci26 = rci_series(closes, 9), rci_series(closes, 26)
@@ -268,7 +268,9 @@ def build_chart(dates: List[str], closes: List[float]) -> List[Dict[str, Any]]:
     out = []
     for i in range(start, n):
         dlabel = dates[i][5:].replace("-", "/") if dates[i] else ""
-        out.append({"d": dlabel, "c": r2(closes[i], 1),
+        out.append({"d": dlabel,
+                    "o": r2(opens[i], 1), "h": r2(highs[i], 1),
+                    "l": r2(lows[i], 1), "c": r2(closes[i], 1),
                     "ma5": r2(ma5[i], 1), "ma25": r2(ma25[i], 1), "ma75": r2(ma75[i], 1),
                     "macd": r2(macd[i], 2), "sig": r2(sig[i], 2), "hist": r2(hist[i], 2),
                     "rci9": r2(rci9[i], 1), "rci26": r2(rci26[i], 1)})
@@ -298,6 +300,9 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
     hist = [h for h in hist if fnum(h.get("AdjC")) is not None]
     hist.sort(key=lambda h: h.get("Date", ""))
     dates = [h.get("Date", "") for h in hist]
+    opens = [fnum(h.get("AdjO")) for h in hist]
+    highs = [fnum(h.get("AdjH")) for h in hist]
+    lows = [fnum(h.get("AdjL")) for h in hist]
     closes = [fnum(h.get("AdjC")) for h in hist]
     vols = [fnum(h.get("AdjVo")) or 0 for h in hist]
     if len(closes) >= 5:
@@ -310,7 +315,7 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         macd, sig, _ = macd_series(closes)
         if macd[-1] is not None and sig[-1] is not None:
             rec["macd_cross"] = macd[-1] > sig[-1]
-        rec["chart"] = build_chart(dates, closes)
+        rec["chart"] = build_chart(dates, opens, highs, lows, closes)
     if len(vols) > crit["ma_avg_window"]:
         base = sum(vols[-(crit["ma_avg_window"] + 1):-1]) / crit["ma_avg_window"]
         if base > 0 and vols[-1]:
@@ -406,6 +411,7 @@ def render(target: str, records: List[Dict[str, Any]]):
             return "○" if v else ("—" if v is None else "×")
         rows.append(f"""<tr onclick="showChart('{r['raw_code']}')">
 <td>{r['label']}</td><td>{r['code']}</td><td>{r['name']}</td><td>{r.get('market','')}</td>
+<td class="num">¥{cell(r.get('price'))}</td>
 <td class="num">{cell(r.get('change_pct'),'%')}</td>
 <td class="num">{cell(r.get('volume_x'),'x')}</td>
 <td>{'S高' if r.get('stop_high') else ''}</td>
@@ -454,10 +460,10 @@ tr.lab-0{{background:#13301f}} tr.lab-1{{background:#1b2433}} tr.lab-3{{opacity:
 </div>
 
 <table><thead><tr>
-<th>判定</th><th>コード</th><th>銘柄</th><th>市場</th><th>前日比</th><th>出来高倍</th><th>S高</th>
+<th>判定</th><th>コード</th><th>銘柄</th><th>市場</th><th>株価(終値)</th><th>前日比</th><th>出来高倍</th><th>S高</th>
 <th>時価総額</th><th>自己資本</th><th>増益</th><th>P.O.</th><th>MACD</th><th>逆指値目安</th><th>タブー</th>
 </tr></thead><tbody>
-{''.join(rows) if rows else '<tr><td colspan="14">該当なし</td></tr>'}
+{''.join(rows) if rows else '<tr><td colspan="15">該当なし</td></tr>'}
 </tbody></table>
 <div class="note">
 P.O.=パーフェクトオーダー。行クリックで価格+MA(5/25/75)・MACD・RCI(9/26)を表示。「—」はデータ取得不可。<br>
@@ -473,23 +479,35 @@ function mk(id, cfg) {{
   return new Chart(el, cfg);
 }}
 function line(label, key, rows, color, opt) {{
-  return Object.assign({{label, data: rows.map(r=>r[key]), borderColor: color,
+  return Object.assign({{type:'line', label, data: rows.map(r=>r[key]), borderColor: color,
     borderWidth: 1.4, pointRadius: 0, tension: .15, spanGaps: true}}, opt||{{}});
 }}
 function showChart(code) {{
-  const d = DATA[code]; if (!d || !d.chart.length) return;
+  const d = DATA[code];
   charts.forEach(c=>c.destroy()); charts = [];
-  document.getElementById('panel').style.display = 'block';
-  document.getElementById('ptitle').textContent = d.code + ' ' + d.name;
+  const panel = document.getElementById('panel'); panel.style.display = 'block';
+  panel.scrollIntoView({{behavior:'smooth',block:'start'}});
+  if (!d || !d.chart || !d.chart.length) {{
+    document.getElementById('ptitle').textContent =
+      (d ? d.code + ' ' + d.name : code) + ' — チャートデータ不足（新規上場等）';
+    return;
+  }}
   const rows = d.chart, labels = rows.map(r=>r.d);
+  const lastC = rows[rows.length-1].c, lastD = rows[rows.length-1].d;
+  document.getElementById('ptitle').textContent =
+    d.code + ' ' + d.name + '　終値 ¥' + lastC + '（' + lastD + '）';
   const grid = {{color:'#222',drawTicks:false}}, tick={{color:'#8b949e',maxTicksLimit:8,font:{{size:9}}}};
-  charts.push(mk('cPrice', {{type:'line', data:{{labels, datasets:[
-      line('終値','c',rows,'#e6edf3',{{borderWidth:1.8}}),
-      line('MA5','ma5',rows,'#f0a020'), line('MA25','ma25',rows,'#3fb950'),
-      line('MA75','ma75',rows,'#58a6ff')]}},
+  const up='#3fb950', dn='#f85149';
+  const wick={{type:'bar',label:'wick',data:rows.map(r=>(r.l!=null&&r.h!=null)?[r.l,r.h]:null),
+    backgroundColor:'#6e7681',barPercentage:0.12,categoryPercentage:0.9,order:3}};
+  const body={{type:'bar',label:'ローソク',data:rows.map(r=>(r.o!=null&&r.c!=null)?[Math.min(r.o,r.c),Math.max(r.o,r.c)]:null),
+    backgroundColor:rows.map(r=>(r.c!=null&&r.o!=null&&r.c>=r.o)?up:dn),barPercentage:0.55,categoryPercentage:0.9,order:2}};
+  charts.push(mk('cPrice', {{type:'bar', data:{{labels, datasets:[wick, body,
+      line('MA5','ma5',rows,'#f0a020',{{order:1}}), line('MA25','ma25',rows,'#58a6ff',{{order:1}}),
+      line('MA75','ma75',rows,'#d2a8ff',{{order:1}})]}},
     options:{{responsive:true,maintainAspectRatio:false,interaction:{{intersect:false,mode:'index'}},
-      plugins:{{legend:{{labels:{{color:'#8b949e',boxWidth:10,font:{{size:10}}}}}}}},
-      scales:{{x:{{grid,ticks:tick}},y:{{grid,ticks:{{color:'#8b949e',font:{{size:9}}}}}}}}}}}}));
+      plugins:{{legend:{{labels:{{color:'#8b949e',boxWidth:10,font:{{size:10}},filter:(it)=>it.text!=='wick'}}}}}},
+      scales:{{x:{{grid,ticks:tick}},y:{{beginAtZero:false,grid,ticks:{{color:'#8b949e',font:{{size:9}}}}}}}}}}}}));
   charts.push(mk('cMacd', {{type:'bar', data:{{labels, datasets:[
       Object.assign({{type:'bar',label:'Hist',data:rows.map(r=>r.hist),backgroundColor:'#39506b'}}),
       line('MACD','macd',rows,'#f0a020'), line('Signal','sig',rows,'#f85149')]}},
