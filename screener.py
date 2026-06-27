@@ -3,18 +3,13 @@
 """
 wbagger-screener : J-Quants API v2 ベースの初動スクリーニング
 - 認証: APIキー方式（x-api-key ヘッダ。ダッシュボードで発行）
-- 前営業日終値ベースで東証グロースの初動候補を抽出
+- 対象市場: 東証グロース＋スタンダード（criteria.yaml の markets で変更可）
+- 前営業日終値ベースで初動候補を抽出
+- 各候補のチャート（MA5/25/75・MACD・RCI9/26）をページに埋め込み（Chart.js描画）
 - docs/data/latest.json と docs/index.html を生成
-本処理は GitHub Actions 上で動かす想定。ローカル実行も可。
 
-J-Quants v2 仕様（要点）:
-- Base: https://api.jquants.com/v2
-- レスポンスは {"data":[...], "pagination_key":...}
-- 株価 /equities/bars/daily : Date,Code,O,H,L,C,UL,LL,Vo,Va,AdjC,AdjVo ...
-- 銘柄 /equities/master      : Code,CoName,MktNm(例 "グロース") ...
-- 財務 /fins/summary         : CurPerType,Sales,OP,NP,TA,Eq,EqAR(小数),CFO,FOP,ShOutFY,TrShFY ...
-- 信用 /markets/margin-interest（列名未確認のため防御的に取得）
-
+J-Quants v2 列名: bars/daily(C,O,H,L,UL,Vo,AdjC,AdjVo) / master(CoName,MktNm) /
+  fins/summary(CurPerType,Sales,OP,NP,Eq,EqAR,CFO,FOP,ShOutFY,TrShFY)
 投資助言ではない。最終判断は自己責任。
 """
 
@@ -34,9 +29,10 @@ except ImportError:
 
 API_BASE = "https://api.jquants.com/v2"
 JST = dt.timezone(dt.timedelta(hours=9))
+CHART_POINTS = 120  # チャート表示日数
 
 DEFAULT_CRITERIA = {
-    "market_name": "グロース",
+    "markets": ["グロース", "スタンダード"],
     "market_cap_oku_min": 10,
     "market_cap_oku_max": 300,
     "change_pct_min": 5.0,
@@ -59,6 +55,11 @@ def load_criteria() -> Dict[str, Any]:
                 crit.update(yaml.safe_load(f) or {})
         except Exception as e:
             print(f"[warn] criteria.yaml 読み込み失敗: {e}")
+    # 後方互換: market_name 単体指定にも対応
+    if "market_name" in crit and "markets" not in crit:
+        crit["markets"] = [crit["market_name"]]
+    if isinstance(crit.get("markets"), str):
+        crit["markets"] = [crit["markets"]]
     return crit
 
 
@@ -69,7 +70,7 @@ class JQuants:
     def __init__(self, api_key: str, min_interval: float = 1.05):
         self.session = requests.Session()
         self.api_key = api_key
-        self.min_interval = min_interval   # Light=60req/min → 約1.05秒/req
+        self.min_interval = min_interval
         self._last = 0.0
 
     def _throttle(self):
@@ -78,14 +79,12 @@ class JQuants:
             time.sleep(self.min_interval - gap)
         self._last = time.time()
 
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None,
-            data_key: str = "data") -> List[Dict[str, Any]]:
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         params = dict(params or {})
         headers = {"x-api-key": self.api_key}
         out: List[Dict[str, Any]] = []
         for _ in range(200):
             self._throttle()
-            resp = None
             for attempt in range(4):
                 resp = self.session.get(f"{API_BASE}{path}", params=params,
                                         headers=headers, timeout=60)
@@ -98,7 +97,7 @@ class JQuants:
             else:
                 resp.raise_for_status()
             body = resp.json()
-            out.extend(body.get(data_key, []) or [])
+            out.extend(body.get("data", []) or [])
             pk = body.get("pagination_key")
             if not pk:
                 break
@@ -107,7 +106,7 @@ class JQuants:
 
 
 # ----------------------------------------------------------------------
-# ユーティリティ / 指標
+# 指標
 # ----------------------------------------------------------------------
 def fnum(x: Any) -> Optional[float]:
     if x is None or x == "":
@@ -124,37 +123,72 @@ def sma(values: List[float], n: int) -> Optional[float]:
     return sum(values[-n:]) / n
 
 
-def ema(values: List[float], n: int) -> Optional[float]:
+def sma_series(values: List[float], n: int) -> List[Optional[float]]:
+    res: List[Optional[float]] = [None] * len(values)
+    s = 0.0
+    for i, v in enumerate(values):
+        s += v
+        if i >= n:
+            s -= values[i - n]
+        if i >= n - 1:
+            res[i] = s / n
+    return res
+
+
+def ema_series(values: List[float], n: int) -> List[Optional[float]]:
+    res: List[Optional[float]] = [None] * len(values)
     if len(values) < n:
-        return None
+        return res
     k = 2 / (n + 1)
     e = sum(values[:n]) / n
-    for v in values[n:]:
-        e = v * k + e * (1 - k)
-    return e
+    res[n - 1] = e
+    for i in range(n, len(values)):
+        e = values[i] * k + e * (1 - k)
+        res[i] = e
+    return res
 
 
-def macd_cross_up(closes: List[float]) -> Optional[bool]:
-    if len(closes) < 35:
-        return None
-    macd_line = []
-    for i in range(26, len(closes) + 1):
-        e12, e26 = ema(closes[:i], 12), ema(closes[:i], 26)
-        if e12 is None or e26 is None:
-            continue
-        macd_line.append(e12 - e26)
-    if len(macd_line) < 10:
-        return None
-    signal = ema(macd_line, 9)
-    if signal is None:
-        return None
-    return macd_line[-1] > signal
+def macd_series(closes: List[float]):
+    e12, e26 = ema_series(closes, 12), ema_series(closes, 26)
+    macd = [(a - b) if (a is not None and b is not None) else None
+            for a, b in zip(e12, e26)]
+    sig: List[Optional[float]] = [None] * len(macd)
+    s = next((i for i, m in enumerate(macd) if m is not None), None)
+    if s is not None:
+        es = ema_series([m for m in macd[s:]], 9)
+        for i, v in enumerate(es):
+            sig[s + i] = v
+    hist = [(m - g) if (m is not None and g is not None) else None
+            for m, g in zip(macd, sig)]
+    return macd, sig, hist
+
+
+def rci_series(closes: List[float], n: int) -> List[Optional[float]]:
+    res: List[Optional[float]] = [None] * len(closes)
+    denom = n * (n * n - 1)
+    for i in range(n - 1, len(closes)):
+        w = closes[i - n + 1:i + 1]               # 古い→新しい
+        order = sorted(range(n), key=lambda k: w[k], reverse=True)
+        price_rank = [0] * n
+        for pos, idx in enumerate(order):
+            price_rank[idx] = pos + 1               # 高い=1
+        sumd2 = 0.0
+        for j in range(n):
+            date_rank = n - j                       # 新しい=1
+            d = date_rank - price_rank[j]
+            sumd2 += d * d
+        res[i] = round((1 - 6 * sumd2 / denom) * 100, 1)
+    return res
 
 
 def disp_code(code: str) -> str:
     if len(code) == 5 and code.endswith("0"):
         return code[:4]
     return code
+
+
+def r2(v, nd=1):
+    return None if v is None else round(v, nd)
 
 
 # ----------------------------------------------------------------------
@@ -182,26 +216,28 @@ def prev_trading_date(jq: JQuants, base: str) -> Optional[str]:
     return None
 
 
-def growth_universe(jq: JQuants, target: str, market_name: str):
+def market_universe(jq: JQuants, target: str, markets: List[str]):
     info = jq.get("/equities/master", {"date": target})
     if not info:
         info = jq.get("/equities/master")
-    codes, names = set(), {}
+    codes, names, mkt = set(), {}, {}
     for r in info:
         names[r["Code"]] = r.get("CoName", "")
-        if market_name in str(r.get("MktNm", "")):
+        mn = str(r.get("MktNm", ""))
+        if any(m in mn for m in markets):
             codes.add(r["Code"])
-    print(f"[ok] 東証{market_name} 銘柄数: {len(codes)}")
-    return codes, names
+            mkt[r["Code"]] = mn
+    print(f"[ok] 対象市場 {markets} 銘柄数: {len(codes)}")
+    return codes, names, mkt
 
 
-def build_shortlist(jq: JQuants, target: str, prev: str, growth_codes: set,
+def build_shortlist(jq: JQuants, target: str, prev: str, uni_codes: set,
                     crit: Dict[str, Any]) -> List[Dict[str, Any]]:
     cur = {r["Code"]: r for r in bars_by_date(jq, target)}
     prv = {r["Code"]: r for r in bars_by_date(jq, prev)}
     shortlist = []
     for code, row in cur.items():
-        if growth_codes and code not in growth_codes:
+        if uni_codes and code not in uni_codes:
             continue
         close = fnum(row.get("C"))
         pclose = fnum(prv.get(code, {}).get("C"))
@@ -210,12 +246,10 @@ def build_shortlist(jq: JQuants, target: str, prev: str, growth_codes: set,
         change = (close - pclose) / pclose * 100
         stop_high = str(row.get("UL")) == "1"
         if change >= crit["change_pct_min"] or stop_high:
-            shortlist.append({
-                "code": code, "close": close,
-                "change_pct": round(change, 2),
-                "stop_high": stop_high, "volume": fnum(row.get("Vo")),
-            })
-    print(f"[ok] 一次候補(グロース・値上がり/S高): {len(shortlist)}件")
+            shortlist.append({"code": code, "close": close,
+                              "change_pct": round(change, 2),
+                              "stop_high": stop_high, "volume": fnum(row.get("Vo"))})
+    print(f"[ok] 一次候補(値上がり/S高): {len(shortlist)}件")
     return shortlist
 
 
@@ -225,12 +259,28 @@ def fy_rows(stmts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return fy
 
 
-def analyze_candidate(jq: JQuants, item: Dict[str, Any],
-                      names: Dict[str, str], crit: Dict[str, Any]) -> Dict[str, Any]:
+def build_chart(dates: List[str], closes: List[float]) -> List[Dict[str, Any]]:
+    ma5, ma25, ma75 = sma_series(closes, 5), sma_series(closes, 25), sma_series(closes, 75)
+    macd, sig, hist = macd_series(closes)
+    rci9, rci26 = rci_series(closes, 9), rci_series(closes, 26)
+    n = len(closes)
+    start = max(0, n - CHART_POINTS)
+    out = []
+    for i in range(start, n):
+        dlabel = dates[i][5:].replace("-", "/") if dates[i] else ""
+        out.append({"d": dlabel, "c": r2(closes[i], 1),
+                    "ma5": r2(ma5[i], 1), "ma25": r2(ma25[i], 1), "ma75": r2(ma75[i], 1),
+                    "macd": r2(macd[i], 2), "sig": r2(sig[i], 2), "hist": r2(hist[i], 2),
+                    "rci9": r2(rci9[i], 1), "rci26": r2(rci26[i], 1)})
+    return out
+
+
+def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
+                      mkt: Dict[str, str], crit: Dict[str, Any]) -> Dict[str, Any]:
     code = item["code"]
     rec = {
         "code": disp_code(code), "raw_code": code,
-        "name": names.get(code, ""),
+        "name": names.get(code, ""), "market": mkt.get(code, ""),
         "price": item["close"], "change_pct": item["change_pct"],
         "stop_high": item["stop_high"],
         "volume_x": None, "market_cap_oku": None,
@@ -238,18 +288,18 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any],
         "op_margin": None, "equity_ratio": None, "roe": None,
         "profit_trend": None, "taboo_hit": None, "taboo_reason": "",
         "margin_long_k": None, "stop_loss": None, "manual_note": "",
+        "chart": [],
     }
 
-    # --- 株価履歴(直近約1.5年): MA / MACD / 出来高倍率 ---
-    frm = (dt.datetime.strptime(item.get("date_target", dt.datetime.now(JST)
-            .strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+    frm = (dt.datetime.strptime(item["date_target"], "%Y-%m-%d").date()
            - dt.timedelta(days=400)).strftime("%Y-%m-%d")
-    hist = jq.get("/equities/bars/daily", {"code": code, "from": frm,
-                  "to": item.get("date_target")})
-    hist = [h for h in hist if fnum(h.get("C")) is not None]
+    hist = jq.get("/equities/bars/daily",
+                  {"code": code, "from": frm, "to": item["date_target"]})
+    hist = [h for h in hist if fnum(h.get("AdjC")) is not None]
     hist.sort(key=lambda h: h.get("Date", ""))
-    closes = [fnum(h.get("C")) for h in hist]
-    vols = [fnum(h.get("Vo")) or 0 for h in hist]
+    dates = [h.get("Date", "") for h in hist]
+    closes = [fnum(h.get("AdjC")) for h in hist]
+    vols = [fnum(h.get("AdjVo")) or 0 for h in hist]
     if len(closes) >= 5:
         ma5, ma25 = sma(closes, 5), sma(closes, 25)
         ma75, ma200 = sma(closes, 75), sma(closes, 200)
@@ -257,35 +307,32 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any],
         if None not in (ma5, ma25, ma75, ma200):
             rec["ma_perfect_order"] = price > ma5 > ma25 > ma75 > ma200
         rec["stop_loss"] = round(min(closes[-5:]))
-        rec["macd_cross"] = macd_cross_up(closes)
+        macd, sig, _ = macd_series(closes)
+        if macd[-1] is not None and sig[-1] is not None:
+            rec["macd_cross"] = macd[-1] > sig[-1]
+        rec["chart"] = build_chart(dates, closes)
     if len(vols) > crit["ma_avg_window"]:
         base = sum(vols[-(crit["ma_avg_window"] + 1):-1]) / crit["ma_avg_window"]
         if base > 0 and vols[-1]:
             rec["volume_x"] = round(vols[-1] / base, 1)
 
-    # --- 財務サマリ ---
     stmts = jq.get("/fins/summary", {"code": code})
     fy = fy_rows(stmts)
     st = fy[-1] if fy else (stmts[-1] if stmts else None)
     if st:
-        sales = fnum(st.get("Sales"))
-        op = fnum(st.get("OP"))
-        np_ = fnum(st.get("NP"))
-        eq = fnum(st.get("Eq"))
-        eqar = fnum(st.get("EqAR"))
+        sales, op, np_ = fnum(st.get("Sales")), fnum(st.get("OP")), fnum(st.get("NP"))
+        eq, eqar = fnum(st.get("Eq")), fnum(st.get("EqAR"))
         if eqar is not None:
-            eqar *= 100  # v2 EqAR は小数比率
+            eqar *= 100
         f_op = fnum(st.get("FOP"))
         shares = fnum(st.get("ShOutFY"))
         treasury = fnum(st.get("TrShFY")) or 0
-
         if sales and op is not None:
             rec["op_margin"] = round(op / sales, 3)
         if eqar is not None:
             rec["equity_ratio"] = round(eqar, 1)
         if eq and np_ is not None and eq != 0:
             rec["roe"] = round(np_ / eq * 100, 1)
-        # 増益: 直近FYのOPが前FYより増加、無ければ予想FOP>OP
         ops = [fnum(r.get("OP")) for r in fy if fnum(r.get("OP")) is not None]
         if len(ops) >= 2:
             rec["profit_trend"] = "増益" if ops[-1] > ops[-2] else "減益/横ばい"
@@ -293,8 +340,6 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any],
             rec["profit_trend"] = "増益" if f_op > op else "減益/横ばい"
         if shares:
             rec["market_cap_oku"] = round(item["close"] * (shares - treasury) / 1e8, 1)
-
-        # タブー
         reasons = []
         if rec["equity_ratio"] is not None and \
                 rec["equity_ratio"] <= crit["taboo_equity_ratio_max"]:
@@ -305,20 +350,17 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any],
         rec["taboo_hit"] = len(reasons) > 0
         rec["taboo_reason"] = " / ".join(reasons)
 
-    # --- 信用残(列名未確認のため防御的) ---
     try:
         mgn = jq.get("/markets/margin-interest", {"code": code})
         if mgn:
             mgn.sort(key=lambda m: m.get("Date", ""))
             last = mgn[-1]
-            longv = None
-            for key in ("LongMarginTradeVolume", "LongVo", "Long",
-                        "LongMargin", "LMgn"):
+            for key in ("LongMarginTradeVolume", "LongVo", "Long", "LongMargin", "LMgn"):
                 if key in last:
-                    longv = fnum(last.get(key))
+                    lv = fnum(last.get(key))
+                    if lv is not None:
+                        rec["margin_long_k"] = round(lv / 1000, 1)
                     break
-            if longv is not None:
-                rec["margin_long_k"] = round(longv / 1000, 1)
     except Exception:
         pass
 
@@ -347,11 +389,8 @@ def label(rec: Dict[str, Any], crit: Dict[str, Any]) -> str:
 def render(target: str, records: List[Dict[str, Any]]):
     docs = os.path.join(os.path.dirname(__file__), "docs")
     os.makedirs(os.path.join(docs, "data"), exist_ok=True)
-    payload = {
-        "generated_at": dt.datetime.now(JST).isoformat(timespec="seconds"),
-        "data_date": target,
-        "candidates": records,
-    }
+    payload = {"generated_at": dt.datetime.now(JST).isoformat(timespec="seconds"),
+               "data_date": target, "candidates": records}
     with open(os.path.join(docs, "data", "latest.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -365,8 +404,8 @@ def render(target: str, records: List[Dict[str, Any]]):
 
         def tri(v):
             return "○" if v else ("—" if v is None else "×")
-        rows.append(f"""<tr class="lab-{order.get(r['label'],9)}">
-<td>{r['label']}</td><td>{r['code']}</td><td>{r['name']}</td>
+        rows.append(f"""<tr onclick="showChart('{r['raw_code']}')">
+<td>{r['label']}</td><td>{r['code']}</td><td>{r['name']}</td><td>{r.get('market','')}</td>
 <td class="num">{cell(r.get('change_pct'),'%')}</td>
 <td class="num">{cell(r.get('volume_x'),'x')}</td>
 <td>{'S高' if r.get('stop_high') else ''}</td>
@@ -375,54 +414,114 @@ def render(target: str, records: List[Dict[str, Any]]):
 <td>{cell(r.get('profit_trend'))}</td>
 <td>{tri(r.get('ma_perfect_order'))}</td>
 <td>{tri(r.get('macd_cross'))}</td>
-<td class="num">{cell(r.get('margin_long_k'),'千')}</td>
 <td class="num">{cell(r.get('stop_loss'))}</td>
 <td class="warn">{r.get('taboo_reason','')}</td>
 </tr>""")
+
+    chart_map = {r["raw_code"]: {"name": r["name"], "code": r["code"],
+                                 "chart": r.get("chart", [])} for r in records}
+    data_js = json.dumps(chart_map, ensure_ascii=False)
+
     html = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>初動スクリーニング (wbagger-screener)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
 body{{font-family:system-ui,'Hiragino Sans',sans-serif;margin:16px;background:#0d1117;color:#e6edf3}}
 h1{{font-size:18px}} .meta{{color:#8b949e;font-size:13px;margin-bottom:12px}}
 table{{border-collapse:collapse;width:100%;font-size:13px}}
 th,td{{border:1px solid #30363d;padding:5px 7px;text-align:left}}
 th{{background:#161b22;position:sticky;top:0}}
+tbody tr{{cursor:pointer}} tbody tr:hover{{background:#21262d}}
 td.num{{text-align:right}} td.warn{{color:#f85149}}
-tr.lab-0{{background:#13301f}} tr.lab-1{{background:#1b2433}} tr.lab-3{{opacity:.55}}
+tr.lab-0{{background:#13301f}} tr.lab-1{{background:#1b2433}} tr.lab-3{{opacity:.6}}
 .note{{color:#8b949e;font-size:12px;margin-top:14px;line-height:1.6}}
+#panel{{display:none;margin:16px 0;padding:12px;border:1px solid #30363d;border-radius:8px;background:#0f141b}}
+#panel h2{{font-size:15px;margin:.2em 0 .6em}}
+.cwrap{{position:relative;height:220px;margin-bottom:10px}}
+.cwrap.small{{height:140px}}
+.close{{float:right;color:#8b949e;cursor:pointer}}
 </style></head><body>
-<h1>初動スクリーニング — 東証グロース</h1>
-<div class="meta">データ基準日: {target} ／ 生成: {dt.datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST ／ 件数: {len(records)}</div>
+<h1>初動スクリーニング — 東証グロース＋スタンダード</h1>
+<div class="meta">データ基準日: {target} ／ 生成: {dt.datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST ／ 件数: {len(records)} ／ 行クリックでチャート表示</div>
+
+<div id="panel">
+  <span class="close" onclick="document.getElementById('panel').style.display='none'">閉じる ✕</span>
+  <h2 id="ptitle"></h2>
+  <div class="cwrap"><canvas id="cPrice"></canvas></div>
+  <div class="cwrap small"><canvas id="cMacd"></canvas></div>
+  <div class="cwrap small"><canvas id="cRci"></canvas></div>
+</div>
+
 <table><thead><tr>
-<th>判定</th><th>コード</th><th>銘柄</th><th>前日比</th><th>出来高倍</th><th>S高</th>
-<th>時価総額</th><th>自己資本</th><th>増益</th><th>P.O.</th><th>MACD</th><th>信用買残</th><th>逆指値目安</th><th>タブー</th>
+<th>判定</th><th>コード</th><th>銘柄</th><th>市場</th><th>前日比</th><th>出来高倍</th><th>S高</th>
+<th>時価総額</th><th>自己資本</th><th>増益</th><th>P.O.</th><th>MACD</th><th>逆指値目安</th><th>タブー</th>
 </tr></thead><tbody>
 {''.join(rows) if rows else '<tr><td colspan="14">該当なし</td></tr>'}
 </tbody></table>
 <div class="note">
-P.O.=パーフェクトオーダー。「—」はデータ取得不可。材料・テーマの中身はJ-Quants非配信のため別途TDnet/EDINETで確認すること。<br>
-本表は手法に基づく機械的抽出であり投資助言ではない。最終判断は自己責任。逆指値目安は直近5日安値。
-</div></body></html>"""
+P.O.=パーフェクトオーダー。行クリックで価格+MA(5/25/75)・MACD・RCI(9/26)を表示。「—」はデータ取得不可。<br>
+材料・テーマの中身はJ-Quants非配信のため別途TDnet/EDINETで確認すること。逆指値目安は直近5日安値。<br>
+本表は手法に基づく機械的抽出であり投資助言ではない。最終判断は自己責任。
+</div>
+
+<script>
+const DATA = {data_js};
+let charts = [];
+function mk(id, cfg) {{
+  const el = document.getElementById(id);
+  return new Chart(el, cfg);
+}}
+function line(label, key, rows, color, opt) {{
+  return Object.assign({{label, data: rows.map(r=>r[key]), borderColor: color,
+    borderWidth: 1.4, pointRadius: 0, tension: .15, spanGaps: true}}, opt||{{}});
+}}
+function showChart(code) {{
+  const d = DATA[code]; if (!d || !d.chart.length) return;
+  charts.forEach(c=>c.destroy()); charts = [];
+  document.getElementById('panel').style.display = 'block';
+  document.getElementById('ptitle').textContent = d.code + ' ' + d.name;
+  const rows = d.chart, labels = rows.map(r=>r.d);
+  const grid = {{color:'#222',drawTicks:false}}, tick={{color:'#8b949e',maxTicksLimit:8,font:{{size:9}}}};
+  charts.push(mk('cPrice', {{type:'line', data:{{labels, datasets:[
+      line('終値','c',rows,'#e6edf3',{{borderWidth:1.8}}),
+      line('MA5','ma5',rows,'#f0a020'), line('MA25','ma25',rows,'#3fb950'),
+      line('MA75','ma75',rows,'#58a6ff')]}},
+    options:{{responsive:true,maintainAspectRatio:false,interaction:{{intersect:false,mode:'index'}},
+      plugins:{{legend:{{labels:{{color:'#8b949e',boxWidth:10,font:{{size:10}}}}}}}},
+      scales:{{x:{{grid,ticks:tick}},y:{{grid,ticks:{{color:'#8b949e',font:{{size:9}}}}}}}}}}}}));
+  charts.push(mk('cMacd', {{type:'bar', data:{{labels, datasets:[
+      Object.assign({{type:'bar',label:'Hist',data:rows.map(r=>r.hist),backgroundColor:'#39506b'}}),
+      line('MACD','macd',rows,'#f0a020'), line('Signal','sig',rows,'#f85149')]}},
+    options:{{responsive:true,maintainAspectRatio:false,
+      plugins:{{legend:{{labels:{{color:'#8b949e',boxWidth:10,font:{{size:10}}}}}}}},
+      scales:{{x:{{grid,ticks:tick}},y:{{grid,ticks:{{color:'#8b949e',font:{{size:9}}}}}}}}}}}}));
+  charts.push(mk('cRci', {{type:'line', data:{{labels, datasets:[
+      line('RCI9','rci9',rows,'#f0a020'), line('RCI26','rci26',rows,'#58a6ff')]}},
+    options:{{responsive:true,maintainAspectRatio:false,
+      plugins:{{legend:{{labels:{{color:'#8b949e',boxWidth:10,font:{{size:10}}}}}}}},
+      scales:{{x:{{grid,ticks:tick}},y:{{min:-100,max:100,grid,
+        ticks:{{color:'#8b949e',font:{{size:9}},stepSize:50}}}}}}}}}}));
+  document.getElementById('panel').scrollIntoView({{behavior:'smooth',block:'start'}});
+}}
+</script>
+</body></html>"""
     with open(os.path.join(docs, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
     print(f"[ok] 出力完了: docs/index.html, docs/data/latest.json ({len(records)}件)")
 
 
-# ----------------------------------------------------------------------
-# メイン
-# ----------------------------------------------------------------------
 def main() -> int:
     api_key = os.environ.get("JQUANTS_API_KEY")
     if not api_key:
-        print("[error] 環境変数 JQUANTS_API_KEY が未設定（J-Quants v2 はAPIキー方式）")
+        print("[error] 環境変数 JQUANTS_API_KEY が未設定（v2はAPIキー方式）")
         return 1
     crit = load_criteria()
     jq = JQuants(api_key)
 
     target = latest_trading_date(jq)
     if not target:
-        print("[error] 取引日データが見つかりません(プランの配信状況/APIキーを確認)")
+        print("[error] 取引日データが見つかりません(配信状況/APIキーを確認)")
         return 1
     prev = prev_trading_date(jq, target)
     if not prev:
@@ -430,18 +529,18 @@ def main() -> int:
         return 1
     print(f"[ok] 対象日={target} / 前日={prev}")
 
-    growth_codes, names = growth_universe(jq, target, crit["market_name"])
-    shortlist = build_shortlist(jq, target, prev, growth_codes, crit)
+    uni_codes, names, mkt = market_universe(jq, target, crit["markets"])
+    shortlist = build_shortlist(jq, target, prev, uni_codes, crit)
     for it in shortlist:
         it["date_target"] = target
 
     records = []
     for i, item in enumerate(shortlist, 1):
         try:
-            rec = analyze_candidate(jq, item, names, crit)
+            rec = analyze_candidate(jq, item, names, mkt, crit)
             rec["label"] = label(rec, crit)
             records.append(rec)
-            print(f"  [{i}/{len(shortlist)}] {rec['code']} {rec['name']} -> {rec['label']}")
+            print(f"  [{i}/{len(shortlist)}] {rec['code']} {rec['name']} ({rec['market']}) -> {rec['label']}")
         except Exception as e:
             print(f"  [warn] {item['code']} 解析失敗: {e}")
 
