@@ -1,0 +1,40 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>20%上昇 的中率バックテスト</title>
+<style>
+body{font-family:system-ui,'Hiragino Sans',sans-serif;margin:16px;background:#0d1117;color:#e6edf3}
+h1{font-size:18px} .meta{color:#8b949e;font-size:13px;margin-bottom:12px}
+table{border-collapse:collapse;width:100%;font-size:13px;max-width:760px}
+th,td{border:1px solid #30363d;padding:7px 9px;text-align:left}
+th{background:#161b22} td.num{text-align:right} td.hl{background:#13251c}
+.sub{color:#8b949e;font-size:11px} .note{color:#8b949e;font-size:12px;margin-top:14px;line-height:1.7}
+a{color:#58a6ff}
+</style></head><body>
+<h1>初動シグナル → +20%到達 的中率バックテスト</h1>
+<div class="meta">期間: 2024-06-29〜2026-06-29 ／ 対象: 東証グロース 595銘柄 ／ 生成: 2026-06-29 08:55 JST<br>
+目標+20% / 損切り-8% / 出来高急増=3.0倍・前日比≥5%</div>
+<table><thead><tr>
+<th>前向き</th><th>ベース<br>(全日)+20%到達</th><th>A:S高<br>+20%到達</th><th>A:期待値</th>
+<th>B:出来高急増<br>+20%到達</th><th>B:期待値</th></tr></thead>
+<tbody><tr><td>5日</td>
+<td class="num">2.9%<br><span class="sub">n=254,374</span></td>
+<td class="num hl">25.4%<br><span class="sub">n=2,019</span></td>
+<td class="num">2.43%</td>
+<td class="num hl">11.2%<br><span class="sub">n=4,010</span></td>
+<td class="num">0.0%</td></tr><tr><td>10日</td>
+<td class="num">6.3%<br><span class="sub">n=251,409</span></td>
+<td class="num hl">29.5%<br><span class="sub">n=1,992</span></td>
+<td class="num">2.54%</td>
+<td class="num hl">15.4%<br><span class="sub">n=3,969</span></td>
+<td class="num">0.03%</td></tr><tr><td>20日</td>
+<td class="num">12.3%<br><span class="sub">n=245,479</span></td>
+<td class="num hl">32.9%<br><span class="sub">n=1,947</span></td>
+<td class="num">2.66%</td>
+<td class="num hl">19.7%<br><span class="sub">n=3,913</span></td>
+<td class="num">0.14%</td></tr></tbody></table>
+<div class="note">
+<b>読み方</b>：「+20%到達」は、シグナル日の翌日以降そのN日以内に終値が+20%に達した割合（生の予測力）。「期待値」は +20%到達で+20%・先に-8%で損切り・どちらも無ければN日後終値で手仕舞いとした1トレード平均リターン。<br>
+シグナルの到達率が<b>ベース(全日平均)を上回るほどエッジがある</b>。期待値がプラスなら逆指値運用で優位。<br>
+<b>限界</b>：上場廃止銘柄は除外（生存バイアスで楽観方向）／日足終値近似でザラ場の到達順序は無視／スリッページ・流動性未考慮／期間は直近約2年（Light）。<br>
+本結果は機械的検証であり投資助言ではない。最終判断は自己責任。 ｜ <a href="./">スクリーニングへ戻る</a>
+</div></body></html>

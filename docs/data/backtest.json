@@ -1,0 +1,55 @@
+{
+  "generated_at": "2026-06-29T08:55:18+09:00",
+  "period": "2024-06-29〜2026-06-29",
+  "codes": 595,
+  "params": {
+    "target_up": 0.2,
+    "stop_dn": -0.08,
+    "vol_x": 3.0,
+    "chg_min": 0.05
+  },
+  "windows": {
+    "5": {
+      "base_reach20_pct": 2.9,
+      "base_n": 254374,
+      "A_stophigh": {
+        "n": 2019,
+        "reach20_pct": 25.4,
+        "expectancy_pct": 2.43
+      },
+      "B_volspike": {
+        "n": 4010,
+        "reach20_pct": 11.2,
+        "expectancy_pct": 0.0
+      }
+    },
+    "10": {
+      "base_reach20_pct": 6.3,
+      "base_n": 251409,
+      "A_stophigh": {
+        "n": 1992,
+        "reach20_pct": 29.5,
+        "expectancy_pct": 2.54
+      },
+      "B_volspike": {
+        "n": 3969,
+        "reach20_pct": 15.4,
+        "expectancy_pct": 0.03
+      }
+    },
+    "20": {
+      "base_reach20_pct": 12.3,
+      "base_n": 245479,
+      "A_stophigh": {
+        "n": 1947,
+        "reach20_pct": 32.9,
+        "expectancy_pct": 2.66
+      },
+      "B_volspike": {
+        "n": 3913,
+        "reach20_pct": 19.7,
+        "expectancy_pct": 0.14
+      }
+    }
+  }
+}
