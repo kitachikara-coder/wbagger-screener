@@ -199,8 +199,9 @@ def bars_by_date(jq: JQuants, date_str: str) -> List[Dict[str, Any]]:
 
 
 def latest_trading_date(jq: JQuants, max_back: int = 8) -> Optional[str]:
+    # 当日(夕方の更新後)から遡って、最新の取引日を探す
     today = dt.datetime.now(JST).date()
-    for i in range(1, max_back + 2):
+    for i in range(0, max_back + 2):
         ds = (today - dt.timedelta(days=i)).strftime("%Y-%m-%d")
         if bars_by_date(jq, ds):
             return ds
