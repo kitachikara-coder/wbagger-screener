@@ -2,8 +2,9 @@ name: screen
 
 on:
   schedule:
-    - cron: "0 23 * * 0-4"
-  workflow_dispatch: {}
+    # 月〜金 09:30 UTC = 月〜金 18:30 JST（当日夕方・データ更新後）
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch: {}   # 手動実行ボタン
 
 permissions:
   contents: write
