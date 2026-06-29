@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-backtest.py : 「初動シグナル → 前向き20%上昇」的中率バックテスト（J-Quants v2）
+backtest.py : S高シグナル × フィルタ別 「+20%到達」的中率バックテスト（J-Quants v2）
 
-仮説検証:
-  値上がり率/出来高急増/S高 の初動シグナルが出た銘柄は、その後 K営業日以内に
-  +20% に到達するか? 的中率・期待値を、ベースレート(全営業日平均)と比較する。
-
-対象: 東証グロース（直近 master 基準）/ 期間: 直近約 LOOKBACK_DAYS 日（Light=約2年）
-シグナル:
-  A) S高（UL=1）
-  B) 出来高急増(≥VOL_X×20日平均) かつ 前日比≥CHG_MIN%
-前向き評価(日足終値ベース近似):
-  エントリー = シグナル日の調整後終値。以後 K 日で
-   - 終値が +20% 到達 → 的中(+0.20)
-   - 先に -8% 到達 → 損切り(-0.08)
-   - どちらも無ければ K 日後終値で手仕舞い(実リターン)
+検証内容:
+  S高（UL=1）翌日エントリーを基準に、各シグナル日時点のフィルタを重ねて
+  +20%到達率・期待値がどう変わるかを比較する。
+  フィルタ（その日までに開示済みの決算＝先読み防止）:
+    PO     : パーフェクトオーダー（株価>MA5>MA25>MA75>MA200）
+    NoTaboo: タブー非該当（自己資本比率>30% かつ 営業CF3期連続マイナスでない）
+    Fund   : 営業利益率≥13% & 自己資本比率≥40% & ROE≥8% & 増益(直近FY>前FY)
+    Full   : PO かつ NoTaboo かつ Fund
+対象: 東証グロース / 期間: 直近約2年（Light）
+前向き評価(日足終値近似): +20%到達→+0.20 / 先に-8%→-0.08 / 期間末手仕舞い→実リターン
 出力: docs/backtest.html, docs/data/backtest.json
 
-注意/限界:
-  - 上場廃止銘柄は現 master に無く除外 → 生存バイアスで的中率はやや楽観
-  - 日足終値近似（ザラ場の到達順序は無視）
-  - スリッページ・流動性・寄り価格は未考慮
-  投資助言ではない。最終判断は自己責任。
+限界: 上場廃止除外の生存バイアス／日足近似でザラ場順序無視／スリッページ等未考慮。
+投資助言ではない。最終判断は自己責任。
 """
 
 import os
@@ -37,16 +31,18 @@ import requests
 API_BASE = "https://api.jquants.com/v2"
 JST = dt.timezone(dt.timedelta(hours=9))
 
-# --- パラメータ ---
-LOOKBACK_DAYS = 730       # 取得期間（日）
-FWD_WINDOWS = [5, 10, 20]  # 前向き評価日数
-TARGET_UP = 0.20          # 目標上昇率
-STOP_DN = -0.08           # 損切り
-VOL_X = 3.0               # 出来高急増倍率
-VOL_WIN = 20              # 出来高平均期間
-CHG_MIN = 0.05            # 出来高急増シグナルの最低前日比
+LOOKBACK_DAYS = 760
+FWD_WINDOWS = [5, 10, 20]
+TARGET_UP = 0.20
+STOP_DN = -0.08
 MARKET_NAME = "グロース"
-MAX_CODES = int(os.environ.get("BT_MAX_CODES", "0"))  # 0=全銘柄（テスト時に制限可）
+MAX_CODES = int(os.environ.get("BT_MAX_CODES", "0"))
+
+BUCKETS = ["base", "A", "A_po", "A_notaboo", "A_fund", "A_full"]
+BUCKET_LABEL = {
+    "base": "ベース(全日)", "A": "S高", "A_po": "S高+PO",
+    "A_notaboo": "S高+タブー除外", "A_fund": "S高+ファンダ", "A_full": "S高+全フィルタ",
+}
 
 
 class JQuants:
@@ -96,14 +92,21 @@ def fnum(x):
         return None
 
 
+def sma_at(values: List[float], i: int, n: int):
+    if i + 1 < n:
+        return None
+    seg = values[i - n + 1:i + 1]
+    if any(v is None for v in seg):
+        return None
+    return sum(seg) / n
+
+
 def growth_codes(jq: JQuants) -> List[str]:
     info = jq.get("/equities/master")
-    codes = [r["Code"] for r in info if MARKET_NAME in str(r.get("MktNm", ""))]
-    return codes
+    return [r["Code"] for r in info if MARKET_NAME in str(r.get("MktNm", ""))]
 
 
 def forward_outcome(adjc: List[float], i: int, k: int):
-    """i 日エントリーで前向き k 日。(reach20, outcome) を返す。"""
     entry = adjc[i]
     if entry is None or entry <= 0:
         return None
@@ -125,7 +128,6 @@ def forward_outcome(adjc: List[float], i: int, k: int):
             outcome = STOP_DN
             break
     if outcome is None:
-        # K日後終値で手仕舞い
         last = None
         for j in range(min(k, len(adjc) - 1 - i), 0, -1):
             if adjc[i + j] is not None:
@@ -133,6 +135,36 @@ def forward_outcome(adjc: List[float], i: int, k: int):
                 break
         outcome = (last / entry - 1) if last else 0.0
     return reach20, outcome
+
+
+def fy_summary(stmts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    fy = [s for s in stmts if str(s.get("CurPerType", "")).upper() == "FY"]
+    fy.sort(key=lambda s: s.get("DiscDate", ""))
+    return fy
+
+
+def eval_filters(fys_asof: List[Dict[str, Any]], adjc, ma_arrays, i):
+    ma5, ma25, ma75, ma200 = ma_arrays
+    price = adjc[i]
+    po = (None not in (ma5[i], ma25[i], ma75[i], ma200[i]) and price is not None
+          and price > ma5[i] > ma25[i] > ma75[i] > ma200[i])
+    fund_ok = False
+    notaboo_ok = False
+    if fys_asof:
+        st = fys_asof[-1]
+        sales, op, np_ = fnum(st.get("Sales")), fnum(st.get("OP")), fnum(st.get("NP"))
+        eq, eqar = fnum(st.get("Eq")), fnum(st.get("EqAR"))
+        eqar = eqar * 100 if eqar is not None else None
+        opm = (op / sales) if (sales and op is not None) else None
+        roe = (np_ / eq * 100) if (eq and np_ is not None and eq != 0) else None
+        ops = [fnum(r.get("OP")) for r in fys_asof if fnum(r.get("OP")) is not None]
+        up = len(ops) >= 2 and ops[-1] > ops[-2]
+        if None not in (opm, eqar, roe):
+            fund_ok = (opm >= 0.13 and eqar >= 40 and roe >= 8 and up)
+        cfs = [fnum(r.get("CFO")) for r in fys_asof if fnum(r.get("CFO")) is not None][-3:]
+        taboo = (eqar is not None and eqar <= 30) or (len(cfs) == 3 and all(c < 0 for c in cfs))
+        notaboo_ok = (eqar is not None) and (not taboo)
+    return po, fund_ok, notaboo_ok
 
 
 def main() -> int:
@@ -151,119 +183,123 @@ def main() -> int:
         codes = codes[:MAX_CODES]
     print(f"[ok] 対象 東証グロース {len(codes)} 銘柄 / 期間 {frm}〜{to}")
 
-    # 集計器
-    stats = {
-        "A_stophigh": {w: {"n": 0, "reach": 0, "exp": 0.0} for w in FWD_WINDOWS},
-        "B_volspike": {w: {"n": 0, "reach": 0, "exp": 0.0} for w in FWD_WINDOWS},
-        "base": {w: {"n": 0, "reach": 0} for w in FWD_WINDOWS},
-    }
+    stats = {b: {w: {"n": 0, "reach": 0, "exp": 0.0} for w in FWD_WINDOWS} for b in BUCKETS}
 
     for idx, code in enumerate(codes, 1):
         try:
             rows = jq.get("/equities/bars/daily", {"code": code, "from": frm, "to": to})
         except Exception as e:
-            print(f"  [warn] {code} 取得失敗: {e}")
+            print(f"  [warn] {code} bars失敗: {e}")
             continue
         rows = [r for r in rows if fnum(r.get("AdjC")) is not None]
         rows.sort(key=lambda r: r.get("Date", ""))
-        if len(rows) < VOL_WIN + max(FWD_WINDOWS) + 2:
+        if len(rows) < 200 + max(FWD_WINDOWS) + 2:
             continue
+        dates = [r.get("Date", "") for r in rows]
         adjc = [fnum(r.get("AdjC")) for r in rows]
-        adjvo = [fnum(r.get("AdjVo")) or 0 for r in rows]
         ul = [str(r.get("UL")) for r in rows]
+        ma5 = [sma_at(adjc, i, 5) for i in range(len(adjc))]
+        ma25 = [sma_at(adjc, i, 25) for i in range(len(adjc))]
+        ma75 = [sma_at(adjc, i, 75) for i in range(len(adjc))]
+        ma200 = [sma_at(adjc, i, 200) for i in range(len(adjc))]
+        ma_arrays = (ma5, ma25, ma75, ma200)
 
-        for i in range(VOL_WIN, len(rows) - 1):
-            # ベースレート（全日）
+        try:
+            stmts = jq.get("/fins/summary", {"code": code})
+        except Exception:
+            stmts = []
+        fys = fy_summary(stmts)
+
+        for i in range(200, len(rows) - 1):
+            # ベース
             for w in FWD_WINDOWS:
                 if i + w < len(rows):
                     res = forward_outcome(adjc, i, w)
                     if res:
                         stats["base"][w]["n"] += 1
-                        if res[0]:
-                            stats["base"][w]["reach"] += 1
-            # シグナルA: S高
-            sig_a = ul[i] == "1"
-            # シグナルB: 出来高急増＋値上がり
-            vbase = sum(adjvo[i - VOL_WIN:i]) / VOL_WIN if VOL_WIN else 0
-            chg = (adjc[i] / adjc[i - 1] - 1) if adjc[i - 1] else 0
-            sig_b = vbase > 0 and adjvo[i] >= VOL_X * vbase and chg >= CHG_MIN
-            for key, fired in (("A_stophigh", sig_a), ("B_volspike", sig_b)):
-                if not fired:
+                        stats["base"][w]["reach"] += 1 if res[0] else 0
+            if ul[i] != "1":
+                continue
+            # シグナル日までに開示済みの FY のみ（先読み防止）
+            asof = [s for s in fys if s.get("DiscDate", "") <= dates[i]]
+            po, fund_ok, notaboo_ok = eval_filters(asof, adjc, ma_arrays, i)
+            fired = {"A": True, "A_po": po, "A_notaboo": notaboo_ok,
+                     "A_fund": fund_ok, "A_full": (po and fund_ok and notaboo_ok)}
+            for w in FWD_WINDOWS:
+                if i + w >= len(rows):
                     continue
-                for w in FWD_WINDOWS:
-                    if i + w >= len(rows):
-                        continue
-                    res = forward_outcome(adjc, i, w)
-                    if not res:
-                        continue
-                    stats[key][w]["n"] += 1
-                    stats[key][w]["reach"] += 1 if res[0] else 0
-                    stats[key][w]["exp"] += res[1]
+                res = forward_outcome(adjc, i, w)
+                if not res:
+                    continue
+                for b, ok in fired.items():
+                    if ok:
+                        stats[b][w]["n"] += 1
+                        stats[b][w]["reach"] += 1 if res[0] else 0
+                        stats[b][w]["exp"] += res[1]
         if idx % 50 == 0:
             print(f"  ...{idx}/{len(codes)} 処理")
 
-    # 集計
     def rate(d):
         return round(d["reach"] / d["n"] * 100, 1) if d["n"] else None
 
+    def expv(d):
+        return round(d["exp"] / d["n"] * 100, 2) if d["n"] else None
+
     result = {"generated_at": dt.datetime.now(JST).isoformat(timespec="seconds"),
               "period": f"{frm}〜{to}", "codes": len(codes),
-              "params": {"target_up": TARGET_UP, "stop_dn": STOP_DN,
-                         "vol_x": VOL_X, "chg_min": CHG_MIN},
-              "windows": {}}
-    for w in FWD_WINDOWS:
-        a, b, base = stats["A_stophigh"][w], stats["B_volspike"][w], stats["base"][w]
-        result["windows"][w] = {
-            "base_reach20_pct": rate(base), "base_n": base["n"],
-            "A_stophigh": {"n": a["n"], "reach20_pct": rate(a),
-                           "expectancy_pct": round(a["exp"] / a["n"] * 100, 2) if a["n"] else None},
-            "B_volspike": {"n": b["n"], "reach20_pct": rate(b),
-                           "expectancy_pct": round(b["exp"] / b["n"] * 100, 2) if b["n"] else None},
-        }
+              "params": {"target_up": TARGET_UP, "stop_dn": STOP_DN},
+              "buckets": {}}
+    for b in BUCKETS:
+        result["buckets"][b] = {"label": BUCKET_LABEL[b],
+                                "w": {w: {"n": stats[b][w]["n"], "reach20_pct": rate(stats[b][w]),
+                                          "expectancy_pct": expv(stats[b][w])} for w in FWD_WINDOWS}}
 
     os.makedirs("docs/data", exist_ok=True)
     with open("docs/data/backtest.json", "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     # HTML
-    rows_html = []
-    for w in FWD_WINDOWS:
-        d = result["windows"][w]
-        rows_html.append(f"""<tr><td>{w}日</td>
-<td class="num">{d['base_reach20_pct']}%<br><span class="sub">n={d['base_n']:,}</span></td>
-<td class="num hl">{d['A_stophigh']['reach20_pct']}%<br><span class="sub">n={d['A_stophigh']['n']:,}</span></td>
-<td class="num">{d['A_stophigh']['expectancy_pct']}%</td>
-<td class="num hl">{d['B_volspike']['reach20_pct']}%<br><span class="sub">n={d['B_volspike']['n']:,}</span></td>
-<td class="num">{d['B_volspike']['expectancy_pct']}%</td></tr>""")
+    head = "".join(f"<th>{w}日<br>到達/期待値</th>" for w in FWD_WINDOWS)
+    body = []
+    for b in BUCKETS:
+        cells = []
+        for w in FWD_WINDOWS:
+            d = result["buckets"][b]["w"][w]
+            rp = "—" if d["reach20_pct"] is None else f"{d['reach20_pct']}%"
+            ep = "—" if d["expectancy_pct"] is None else f"{d['expectancy_pct']}%"
+            cells.append(f'<td class="num">{rp}<br><span class="sub">{ep} / n={d["n"]:,}</span></td>')
+        cls = "hl" if b == "A_full" else ("base" if b == "base" else "")
+        body.append(f'<tr class="{cls}"><td>{result["buckets"][b]["label"]}</td>{"".join(cells)}</tr>')
+
     html = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>20%上昇 的中率バックテスト</title>
+<title>S高×フィルタ別 +20%到達 バックテスト</title>
 <style>
 body{{font-family:system-ui,'Hiragino Sans',sans-serif;margin:16px;background:#0d1117;color:#e6edf3}}
 h1{{font-size:18px}} .meta{{color:#8b949e;font-size:13px;margin-bottom:12px}}
-table{{border-collapse:collapse;width:100%;font-size:13px;max-width:760px}}
+table{{border-collapse:collapse;width:100%;font-size:13px;max-width:720px}}
 th,td{{border:1px solid #30363d;padding:7px 9px;text-align:left}}
-th{{background:#161b22}} td.num{{text-align:right}} td.hl{{background:#13251c}}
+th{{background:#161b22}} td.num{{text-align:right}}
+tr.hl{{background:#13301f}} tr.base{{color:#8b949e}}
 .sub{{color:#8b949e;font-size:11px}} .note{{color:#8b949e;font-size:12px;margin-top:14px;line-height:1.7}}
 a{{color:#58a6ff}}
 </style></head><body>
-<h1>初動シグナル → +20%到達 的中率バックテスト</h1>
-<div class="meta">期間: {result['period']} ／ 対象: 東証グロース {result['codes']}銘柄 ／ 生成: {dt.datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST<br>
-目標+20% / 損切り-8% / 出来高急増={VOL_X}倍・前日比≥{int(CHG_MIN*100)}%</div>
-<table><thead><tr>
-<th>前向き</th><th>ベース<br>(全日)+20%到達</th><th>A:S高<br>+20%到達</th><th>A:期待値</th>
-<th>B:出来高急増<br>+20%到達</th><th>B:期待値</th></tr></thead>
-<tbody>{''.join(rows_html)}</tbody></table>
+<h1>S高シグナル × フィルタ別　+20%到達 的中率</h1>
+<div class="meta">期間: {result['period']} ／ 東証グロース {result['codes']}銘柄 ／ 生成: {dt.datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST<br>
+目標+20% / 損切り-8% ／ 各セル＝[+20%到達率] ／ [期待値 / 母数n]</div>
+<table><thead><tr><th>条件</th>{head}</tr></thead><tbody>
+{''.join(body)}
+</tbody></table>
 <div class="note">
-<b>読み方</b>：「+20%到達」は、シグナル日の翌日以降そのN日以内に終値が+20%に達した割合（生の予測力）。「期待値」は +20%到達で+20%・先に-8%で損切り・どちらも無ければN日後終値で手仕舞いとした1トレード平均リターン。<br>
-シグナルの到達率が<b>ベース(全日平均)を上回るほどエッジがある</b>。期待値がプラスなら逆指値運用で優位。<br>
-<b>限界</b>：上場廃止銘柄は除外（生存バイアスで楽観方向）／日足終値近似でザラ場の到達順序は無視／スリッページ・流動性未考慮／期間は直近約2年（Light）。<br>
+<b>読み方</b>：到達率がベースを大きく上回り、フィルタを重ねるほど上がれば、その条件にエッジがある。期待値（-8%損切り込み1トレード平均）がプラスなら逆指値運用で優位。母数nが小さいフィルタは統計的にブレる点に注意。<br>
+フィルタはシグナル日までに開示済みの決算のみで判定（先読み防止）。<br>
+<b>限界</b>：上場廃止除外の生存バイアス／日足終値近似／スリッページ・流動性・寄り価格未考慮／グロースのみ・直近約2年。<br>
 本結果は機械的検証であり投資助言ではない。最終判断は自己責任。 ｜ <a href="./">スクリーニングへ戻る</a>
 </div></body></html>"""
     with open("docs/backtest.html", "w", encoding="utf-8") as f:
         f.write(html)
     print("[ok] 出力: docs/backtest.html, docs/data/backtest.json")
-    print(json.dumps(result["windows"], ensure_ascii=False, indent=2))
+    print(json.dumps({b: result["buckets"][b]["w"] for b in BUCKETS}, ensure_ascii=False, indent=2))
     return 0
 
 
