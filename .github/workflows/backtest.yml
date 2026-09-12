@@ -1,7 +1,7 @@
 name: backtest
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # 手動実行のみ（重いので自動化しない）
 
 permissions:
   contents: write
@@ -23,7 +23,7 @@ jobs:
       - name: Run backtest
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          BT_MAX_CODES: "0"
+          BT_MAX_CODES: "0"   # 0=全グロース銘柄。試しに動かすなら 50 など
         run: python backtest.py
 
       - name: Commit results
