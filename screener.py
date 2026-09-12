@@ -639,6 +639,140 @@ def past_sh_episodes(dates: List[str], highs: List[Optional[float]],
     return eps[-limit:]
 
 
+# ----------------------------------------------------------------------
+# P3: 判断ログ（買う / 見送り を自分で記録し、5営業日後の実績と突き合わせる）
+# ----------------------------------------------------------------------
+DECISIONS_REL = os.path.join("data", "decisions.json")
+DECISION_HOLD = 5          # 突合する営業日数
+DECISION_MAX_FETCH = 30    # 当日の候補に居ないコードを追加取得する上限（超えた分は理由を出す）
+
+
+def load_decisions(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """docs/data/decisions.json を読む。無い・空・壊れていても [] を返して止めない。
+
+    1件ずつ検証し、date と code が読めない行だけを捨てる（1行の書き損じで全部を失わない）。
+    """
+    path = path or os.path.join(DOCS_DIR, DECISIONS_REL)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"[warn] {path} が読めません({e})。判断ログは空として続行します")
+        return []
+    items = raw.get("decisions") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        print(f"[warn] {path} の decisions が配列ではありません。判断ログは空として続行します")
+        return []
+    out, bad = [], 0
+    for r in items:
+        if not isinstance(r, dict):
+            bad += 1
+            continue
+        d, c = _norm_date(r.get("date")), str(r.get("code") or "").strip()
+        if d is None or not c:
+            bad += 1
+            continue
+        out.append({"date": d.isoformat(), "code": disp_code(c),
+                    "action": str(r.get("action") or "").strip() or "buy",
+                    "reason": str(r.get("reason") or "").strip(),
+                    "price": fnum(r.get("price"))})
+    if bad:
+        print(f"[warn] 判断ログの {bad}件は date/code が読めないため無視しました")
+    out.sort(key=lambda r: (r["date"], r["code"]))
+    return out
+
+
+def settle_decision(dec: Dict[str, Any], dates: List[str], closes: List[Optional[float]],
+                    today: str, hold: int = DECISION_HOLD) -> Dict[str, Any]:
+    """判断日の hold 営業日後の終値と price を比べる。日足は昇順・調整済みを渡すこと。
+
+    - 判断日が休場なら「その日以降で最初の営業日」を起点にする
+    - hold 営業日ぶんのバーがまだ無ければ「経過待ち」（残り日数つき）
+    - price が無ければ起点日の終値を建値とみなす（見送りの記録で price を省けるように）
+    """
+    out = {"status": "unknown", "base_date": None, "entry": None,
+           "exit_date": None, "exit": None, "pnl_pct": None, "left": None, "reason": ""}
+    if not dates:
+        out["reason"] = "日足なし"
+        return out
+    i = next((k for k, d in enumerate(dates) if d >= dec["date"]), None)
+    if i is None:
+        out["reason"] = "判断日が日足の範囲外"
+        return out
+    entry = dec.get("price")
+    if entry is None:
+        entry = closes[i] if i < len(closes) else None
+    if entry is None or entry <= 0:
+        out["reason"] = "建値が不明"
+        return out
+    out["base_date"], out["entry"] = dates[i], entry
+    j = i + hold
+    if j >= len(dates):
+        # まだ hold 営業日ぶんのバーが無い（today より先の話）
+        out["status"] = "pending"
+        out["left"] = hold - (len(dates) - 1 - i)
+        return out
+    c = closes[j]
+    if c is None:
+        out["reason"] = "手仕舞い日の終値なし"
+        return out
+    out["status"] = "done"
+    out["exit_date"], out["exit"] = dates[j], c
+    out["pnl_pct"] = (c / entry - 1) * 100
+    return out
+
+
+def settle_decisions(jq: JQuants, decisions: List[Dict[str, Any]],
+                     series_by_code: Dict[str, Tuple[List[str], List[Optional[float]]]],
+                     target: str, max_fetch: int = DECISION_MAX_FETCH) -> List[Dict[str, Any]]:
+    """判断ログに実績を付ける。当日の候補に無いコードだけ日足を追加取得する。
+
+    追加取得は max_fetch 件まで。打ち切った分は結果に理由を残す（黙って落とさない）。
+    """
+    need = sorted({d["code"] for d in decisions if d["code"] not in series_by_code})
+    fetched, skipped = 0, []
+    frm = (dt.datetime.strptime(target, "%Y-%m-%d").date()
+           - dt.timedelta(days=400)).strftime("%Y-%m-%d")
+    for code in need:
+        if fetched >= max_fetch:
+            skipped.append(code)
+            continue
+        try:
+            rows = api(jq, "/equities/bars/daily", {"code": code, "from": frm, "to": target})
+        except Exception as e:
+            print(f"  [warn] 判断ログ {code} の日足取得に失敗: {e}")
+            continue
+        rows = [r for r in rows if fnum(r.get("AdjC")) is not None]
+        rows.sort(key=lambda r: r.get("Date", ""))
+        series_by_code[code] = ([r.get("Date", "") for r in rows],
+                                [fnum(r.get("AdjC")) for r in rows])
+        fetched += 1
+    if skipped:
+        print(f"[warn] 判断ログの {len(skipped)}件は追加取得の上限({max_fetch})を超えたため"
+              f"実績を出せません: {', '.join(skipped)}")
+    out = []
+    for d in decisions:
+        dates, closes = series_by_code.get(d["code"], ([], []))
+        r = dict(d)
+        if not dates and d["code"] in skipped:
+            r["outcome"] = {"status": "unknown", "reason": f"追加取得の上限({max_fetch})超過",
+                            "base_date": None, "entry": None, "exit_date": None,
+                            "exit": None, "pnl_pct": None, "left": None}
+        else:
+            r["outcome"] = settle_decision(d, dates, closes, target)
+            if isinstance(r["outcome"].get("pnl_pct"), float):
+                r["outcome"]["pnl_pct"] = round(r["outcome"]["pnl_pct"], 2)
+        out.append(r)
+    if decisions:
+        done = sum(1 for r in out if r["outcome"]["status"] == "done")
+        pend = sum(1 for r in out if r["outcome"]["status"] == "pending")
+        print(f"[ok] 判断ログ {len(out)}件（実績確定 {done} / 経過待ち {pend} / "
+              f"不明 {len(out) - done - pend}）・追加取得 {fetched}回")
+    return out
+
+
 def build_shortlist(jq: JQuants, target: str, prev: str, uni_codes: set,
                     sh_map: Dict[str, Dict[str, Any]], crit: Dict[str, Any],
                     cache=None) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -897,6 +1031,7 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         "taboo": rec["taboo_reason"], "taboo_hit": rec["taboo_hit"],
         "sh_date": rec["sh_date"], "sh_vol": rec["sh_vol"],
     }
+    rec["_series"] = (dates, closes)     # 判断ログの突合で使い回す（追加API 0）。latest.json には出さない
     return rec
 
 
@@ -1091,13 +1226,74 @@ function secSector(c) {
      + '件数が少なく、地合いも違う。同業種の本数も母数が業種ごとに違う。</div>';
   return h + '</section>';
 }
+// ---- P3: 判断ログ ----------------------------------------------------------
+function pnlHtml(o) {
+  if (!o) return '<span class="muted">' + NA + '</span>';
+  if (o.status === 'pending') return '<span class="muted">経過待ち（あと' + o.left + '営業日）</span>';
+  if (o.status !== 'done') return '<span class="muted">' + NA + '（' + esc(o.reason || '不明') + '）</span>';
+  const cls = o.pnl_pct >= 0 ? 'good' : 'warn';
+  return '<b class="' + cls + '">' + sv(o.pnl_pct, 2, '%') + '</b>'
+       + ' <span class="muted">(' + esc(o.base_date) + ' ' + o.entry.toFixed(0)
+       + ' → ' + esc(o.exit_date) + ' ' + o.exit.toFixed(0) + ')</span>';
+}
+function decRows(list) {
+  return list.map(function (d) {
+    return '<tr><td>' + esc(d.date) + '</td><td>' + esc(d.code) + '</td><td>'
+         + (d.action === 'buy' ? '買う' : d.action === 'skip' ? '見送り' : esc(d.action))
+         + '</td><td>' + esc(d.reason) + '</td><td>' + pnlHtml(d.outcome) + '</td></tr>';
+  }).join('');
+}
+function secDecision(code, disp) {
+  const mine = DECISIONS.filter(function (d) { return d.code === disp; });
+  let h = '<section><h3>判断ログ</h3>';
+  h += '<div class="kv"><span>判断</span><b>'
+     + '<label><input type="radio" name="dact" value="buy" checked> 買う</label> '
+     + '<label><input type="radio" name="dact" value="skip"> 見送り</label></b></div>';
+  h += '<div style="margin:6px 0"><input type="text" id="d-reason" placeholder="理由（例: 25MA到達＋枯れ比18%で反発）" style="width:100%"></div>';
+  h += '<div style="margin:6px 0"><label>建値 <input type="number" id="d-price" step="1" style="width:90px"></label> '
+     + '<button type="button" id="d-copy" data-code="' + esc(disp) + '">JSON行をコピー</button> '
+     + '<span id="d-msg" class="muted"></span></div>';
+  if (mine.length) {
+    h += '<table><thead><tr><th>判断日</th><th>コード</th><th>判断</th><th>理由</th><th>'
+       + DECISION_HOLD + '営業日後</th></tr></thead><tbody>' + decRows(mine) + '</tbody></table>';
+  } else {
+    h += '<div class="body muted">この銘柄の記録はまだ無い</div>';
+  }
+  h += '<div class="ref">コピーした1行を GitHub 上で <code>docs/data/decisions.json</code> の '
+     + '<code>decisions</code> 配列に貼って Commit する（Pages から直接は書き込めない）。'
+     + '次回の実行で' + DECISION_HOLD + '営業日後の終値と突き合わせて損益が入る。'
+     + '建値を空にすると判断日の終値を建値とみなす。</div>';
+  return h + '</section>';
+}
+function wireDecision() {
+  const btn = document.getElementById('d-copy');
+  if (!btn) return;
+  btn.onclick = function () {
+    const act = document.querySelector('input[name="dact"]:checked');
+    const price = document.getElementById('d-price').value.trim();
+    const row = {date: TARGET, code: btn.getAttribute('data-code'),
+                 action: act ? act.value : 'buy',
+                 reason: document.getElementById('d-reason').value.trim()};
+    if (price !== '') row.price = parseFloat(price);
+    const text = JSON.stringify(row) + ',';
+    const msg = document.getElementById('d-msg');
+    const done = function (ok) { msg.textContent = ok ? 'コピーした: ' + text : text; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); },
+                                               function () { done(false); });
+    } else { done(false); }
+  };
+}
+
 function renderCard(code) {
   const el = document.getElementById('card');
   if (!el) return;
   if (vchart) { vchart.destroy(); vchart = null; }
   const d = DATA[code], c = d && d.card;
   if (!c || !Object.keys(c).length) { el.innerHTML = ''; return; }
-  el.innerHTML = secMaterial(c) + secPosition(c) + secMargin(c) + secVolume(c) + secSector(c);
+  el.innerHTML = secMaterial(c) + secPosition(c) + secMargin(c) + secVolume(c) + secSector(c)
+               + secDecision(code, d.code);
+  wireDecision();
   const vp = c.vol_profile || [];
   const cv = document.getElementById('cVol');
   if (cv && vp.length) {
@@ -1183,6 +1379,16 @@ function fillSelect(id, values, allLabel) {
       const el = document.getElementById(id);
       if (el) { el.addEventListener('input', draw); el.addEventListener('change', draw); }
     });
+  const dl = document.getElementById('declog');
+  if (dl) {
+    dl.innerHTML = DECISIONS.length
+      ? '<table><thead><tr><th>判断日</th><th>コード</th><th>判断</th><th>理由</th><th>'
+        + DECISION_HOLD + '営業日後</th></tr></thead><tbody>'
+        + decRows(DECISIONS.slice().reverse()) + '</tbody></table>'
+      : '<div class="muted">まだ1件も記録が無い。'
+        + '行をクリックしてカードの「判断ログ」から1行コピーし、'
+        + 'GitHub 上で docs/data/decisions.json に貼る。</div>';
+  }
   const rs = document.getElementById('f-reset');
   if (rs) rs.onclick = function () {
     ['f-ddmin', 'f-ddmax', 'f-dry', 'f-to', 'f-q'].forEach(function (id) {
@@ -1224,7 +1430,8 @@ def _row_payload(r: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def render(target: str, records: List[Dict[str, Any]], crit: Optional[Dict[str, Any]] = None,
-           docs: Optional[str] = None, dropped: int = 0):
+           docs: Optional[str] = None, dropped: int = 0,
+           decisions: Optional[List[Dict[str, Any]]] = None):
     crit = crit or DEFAULT_CRITERIA
     docs = docs or DOCS_DIR
     os.makedirs(os.path.join(docs, "data"), exist_ok=True)
@@ -1234,13 +1441,16 @@ def render(target: str, records: List[Dict[str, Any]], crit: Optional[Dict[str, 
                                                is not None else 1e9)), reverse=True)
     # latest.json はチャート系列を持たない（同じ内容が index.html に埋まっているため。
     # 入れると1銘柄あたり約78KB＝90銘柄で7MBになり、毎営業日そのままコミットされる）
-    slim = [{k: v for k, v in r.items() if k != "chart"} for r in records]
+    decisions = decisions or []
+    slim = [{k: v for k, v in r.items() if k not in ("chart", "_series")} for r in records]
     payload = {"generated_at": dt.datetime.now(JST).isoformat(timespec="seconds"),
-               "data_date": target, "dropped": dropped, "candidates": slim}
+               "data_date": target, "dropped": dropped, "candidates": slim,
+               "decisions": decisions}
     with open(os.path.join(docs, "data", "latest.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
 
     rows_js = _json_script([_row_payload(r) for r in records])
+    dec_js = _json_script(decisions)
     chart_map = {r["raw_code"]: {"name": r["name"], "code": r["code"],
                                  "chart": r.get("chart", []),
                                  "card": r.get("card", {})} for r in records}
@@ -1287,6 +1497,11 @@ tr.today{{background:#13301f}}
 #card table{{font-size:11px;width:100%}} #card th,#card td{{padding:2px 4px}}
 #card .ref{{color:#6e7681;font-size:11px;margin-top:6px;line-height:1.6}}
 #card .vwrap{{position:relative;height:110px}}
+#card input[type=text],#card input[type=number]{{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:2px 5px;font-size:12px}}
+#card button{{background:#21262d;color:#e6edf3;border:1px solid #30363d;padding:3px 10px;border-radius:5px;cursor:pointer;font-size:12px}}
+h2{{font-size:15px;margin:22px 0 8px}}
+#declog{{font-size:12px;color:#8b949e}} #declog table{{width:auto;min-width:min(100%,700px)}}
+#declog .muted{{color:#6e7681}} #declog .warn{{color:#f85149}} #declog .good{{color:#3fb950}}
 #filters{{margin:10px 0;padding:8px 10px;border:1px solid #30363d;border-radius:8px;background:#0f141b;font-size:12px;color:#8b949e}}
 #filters label{{margin-right:14px;display:inline-block;line-height:2}}
 #filters input,#filters select{{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:2px 5px;font-size:12px}}
@@ -1330,6 +1545,10 @@ tr.today{{background:#13301f}}
 </div>
 
 <table><thead><tr id="thead"></tr></thead><tbody id="tbody"></tbody></table>
+
+<h2 id="declog-h">判断ログ（買う／見送りの記録と {DECISION_HOLD}営業日後の実績）</h2>
+<div id="declog"></div>
+
 <div class="note">
 <b>読み方</b>：この表は「買うべき銘柄」を選んだものではない。直近{crit.get('sh_window', 20)}営業日にストップ高をつけた銘柄を全部並べ、
 <b>S高からの日数・高値からの下落率・出来高枯れ比</b>で押し目の段階を本人が読み取るためのもの。合成スコア・総合判定は置かない。<br>
@@ -1347,6 +1566,8 @@ tr.today{{background:#13301f}}
 下落日と反発日の平均出来高／位置要約／同業種の当日上昇本数／過去2年のS高エピソード）。
 <b>信用倍率＝買残÷売残で、日証金の貸借倍率とは別物</b>（日証金分はJ-Quants非配信）。<br>
 「{NA}」はデータ取得不可・算出不能、「{MATERIAL_UNSET}」は手入力待ち。材料の中身はJ-Quants非配信のためTDnet/EDINETで確認すること。<br>
+<b>判断ログ</b>は自分で書いた記録で、システムの推奨ではない。{DECISION_HOLD}営業日後の終値との差を機械的に出すだけで、
+「当たり/外れ」の判定でも次の売買の根拠でもない。件数が貯まるまでは方向すら読めない【推測】。<br>
 本表は手法に基づく機械的抽出であり投資助言ではない。最終判断は自己責任。
 </div>
 
@@ -1356,6 +1577,8 @@ const ROWS = {rows_js};
 const TARGET = "{target}";
 const MATERIAL_UNSET = "{MATERIAL_UNSET}";
 const NA = "{NA}";
+const DECISIONS = {dec_js};
+const DECISION_HOLD = {DECISION_HOLD};
 let charts = [];
 function mk(id, cfg) {{
   const el = document.getElementById(id);
@@ -1478,7 +1701,10 @@ def main() -> int:
               f"部分的な結果は公開せず中断します（前回のページを残す）")
         return 1
 
-    render(target, records, crit, dropped=len(failed))
+    series_by_code = {r["code"]: r.pop("_series") for r in records if "_series" in r}
+    decisions = settle_decisions(jq, load_decisions(), series_by_code, target)
+
+    render(target, records, crit, dropped=len(failed), decisions=decisions)
     print(f"[ok] APIリクエスト(論理) 合計 {REQ['n']} 回"
           f"（抽出まで {req_before_codes} / 銘柄別 {REQ['n'] - req_before_codes}）"
           f" / 所要 {time.time() - t0:.0f}秒")

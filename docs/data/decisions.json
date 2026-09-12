@@ -1,0 +1,9 @@
+{
+  "_readme": [
+    "判断ログ。ダッシュボードの銘柄カードで「JSON行をコピー」した1行を decisions 配列に貼り、GitHub上で Commit する。",
+    "screener.py が起動時に読み、各行の5営業日後の終値と price を比べて損益%を出す（5営業日未経過は「経過待ち」）。",
+    "date: 判断した日 YYYY-MM-DD ／ code: 4桁の表示コード ／ action: buy か skip ／ reason: 自由記述 ／ price: 建値（省略すると判断日の終値）",
+    "date と code が読めない行だけが無視される。ファイルが壊れていても実行は止まらない。"
+  ],
+  "decisions": []
+}
