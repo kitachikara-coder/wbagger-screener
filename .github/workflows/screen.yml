@@ -29,12 +29,36 @@ jobs:
 
       - name: Commit results
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add docs
           if git diff --cached --quiet; then
             echo "no changes"
-          else
-            git commit -m "screening update ($(TZ=Asia/Tokyo date +%Y-%m-%d))"
-            git push
+            exit 0
           fi
+          git commit -m "screening update ($(TZ=Asia/Tokyo date +%Y-%m-%d))"
+
+          # 実行中に人が push していると push が rejected になるので、先に取り込む。
+          # docs/ は毎回まるごと生成し直すので、競合したら生成側を採る。
+          # ただし -X theirs のような全体指定は使わない（docs/ 以外の人の変更まで
+          # 黙って捨ててしまうため）。docs/ 以外が競合したら中断してジョブを落とす。
+          if ! git pull --rebase origin "$GITHUB_REF_NAME"; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ -z "$conflicts" ] || printf '%s\n' "$conflicts" | grep -qv '^docs/'; then
+              echo "::error::rebase に失敗したため中断しました（docs/ 以外の競合、または競合以外の失敗）"
+              printf '%s\n' "$conflicts"
+              git rebase --abort || true
+              exit 1
+            fi
+            echo "::warning::docs/ が競合したので生成側を採用します"
+            printf '%s\n' "$conflicts"
+            # rebase 中の --theirs は「再生中のコミット」＝この実行が生成した側
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              git checkout --theirs -- "$f"
+              git add -- "$f"
+            done <<< "$conflicts"
+            GIT_EDITOR=true git rebase --continue
+          fi
+          git push origin "HEAD:$GITHUB_REF_NAME"
