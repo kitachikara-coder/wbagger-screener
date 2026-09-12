@@ -47,6 +47,11 @@ MATERIAL_UNSET = "未"    # 材料分類の未入力
 # 材料分類（手入力の選択肢。表示順もこの順）
 MATERIAL_CLASSES = ["上方修正", "大型契約・提携", "テーマ連想", "仕手・材料不明"]
 
+# S高種別。UL=1 は「上限に触れた」フラグなので、引け張り付きとは限らない
+SH_STICK = "張り付き"     # S高日の終値 = 当日高値
+SH_TOUCH = "一時"         # 上限に触れたが引けで戻された
+SH_KINDS = [SH_STICK, SH_TOUCH]
+
 # 論理APIコール数（jq.get 1回=1。内部ページングは含まない。実測用）
 REQ = {"n": 0}
 
@@ -288,7 +293,7 @@ def recent_stop_high(jq: JQuants, uni_codes: set, target: str, window: int = 20,
                      cache=None) -> Dict[str, Dict[str, Any]]:
     """直近 window 営業日（target を含む）に UL=1 があった銘柄を集める。
 
-    戻り値 {code: {"sh_date","sh_vol","sh_close"}}。新しい日から遡るので、
+    戻り値 {code: {"sh_date","sh_vol","sh_close","sh_kind"}}。新しい日から遡るので、
     同一銘柄が複数回S高していれば **最新のS高日** が採用される。
     追加APIは「実際に走査した営業日数 − キャッシュ済みの日数」。
     """
@@ -318,12 +323,32 @@ def recent_stop_high(jq: JQuants, uni_codes: set, target: str, window: int = 20,
                 continue
             found[code] = {"sh_date": ds,
                            "sh_vol": fnum(r.get("AdjVo")),
-                           "sh_close": fnum(r.get("AdjC"))}
+                           "sh_close": fnum(r.get("AdjC")),
+                           # 生値の H/C で判定する（UL が生値ベースのフラグのため）
+                           "sh_kind": stop_high_kind(r.get("H"), r.get("C"))}
     print(f"[ok] S高探索: 直近{len(scanned)}営業日({scanned[-1] if scanned else '—'}〜{target}) "
           f"→ {len(found)}銘柄")
     if len(scanned) < window:
         print(f"  [warn] 走査できた営業日が {len(scanned)}/{window} 日にとどまった（暦日上限）")
     return found
+
+
+def stop_high_kind(high: Any, close: Any, eps: float = 1e-9) -> Optional[str]:
+    """S高日のバーを「張り付き／一時」に分ける。**調整前の生値 H・C を渡すこと。**
+
+    `UL` は生値ベースのフラグなので、調整後(Adj*)の系列と混ぜない。
+    - 張り付き: 終値が当日高値と同値（`C >= H - eps`）＝引けまで上限で買われ続けた
+    - 一時    : `C < H`＝上限に触れたが引けで戻された
+    - `H` か `C` が欠損なら **None**（画面は「—」）。「一時」に倒さない
+
+    浮動小数の等値比較を避けるため eps を引く。
+    「高値の99.5%以上なら張り付き」のようなしきい値は**入れない**（検証していない）。
+    どちらが有利かは未検証なので、この値は表示のみで並び順・配点には使わない。
+    """
+    h, c = fnum(high), fnum(close)
+    if h is None or c is None:
+        return None
+    return SH_STICK if c >= h - eps else SH_TOUCH
 
 
 def dip_metrics(dates: List[str], highs: List[Optional[float]], closes: List[Optional[float]],
@@ -868,7 +893,7 @@ def build_shortlist(jq: JQuants, target: str, prev: str, uni_codes: set,
                           "stop_high": str(row.get("UL")) == "1",
                           "volume": fnum(row.get("Vo")),
                           "sh_date": sh["sh_date"], "sh_vol": sh.get("sh_vol"),
-                          "sh_close": sh.get("sh_close")})
+                          "sh_close": sh.get("sh_close"), "sh_kind": sh.get("sh_kind")})
     today_sh = sum(1 for s in shortlist if s["sh_date"] == target)
     print(f"[ok] 母集団(直近{crit['sh_window']}営業日にS高): {len(shortlist)}件"
           f"（うち当日S高 {today_sh}件 / 押し目進行中 {len(shortlist) - today_sh}件"
@@ -945,7 +970,8 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         "price": item["close"], "change_pct": item["change_pct"],
         "stop_high": item["stop_high"],
         # --- 層A: 押し目の熟成度（事実のみ） ---
-        "sh_date": item.get("sh_date"), "sh_vol": item.get("sh_vol"),
+        "sh_date": item.get("sh_date"), "sh_kind": item.get("sh_kind"),
+        "sh_vol": item.get("sh_vol"),
         "days_from_peak": None, "dd_pct": None, "dry_pct": None, "dry5_pct": None,
         "peak": None, "peak_date": None, "turnover_oku": None,
         "earn_date": None, "earn_src": None, "earn_bdays": None,
@@ -1120,6 +1146,7 @@ const COLS = [
   {k:'n',    t:'銘柄',          num:false},
   {k:'mk',   t:'市場',          num:false},
   {k:'sh',   t:'ストップ高日',  num:false},
+  {k:'sk',   t:'S高種別',      num:false},
   {k:'dp',   t:'高値から(日)',  num:true},
   {k:'dd',   t:'高値から(%)',   num:true},
   {k:'dry',  t:'枯れ比 当日',   num:true},
@@ -1164,6 +1191,10 @@ function cellHtml(col, r) {
   else if (col.k === 'ed')  {
     txt = fmt(v, '日', 0) + (r.es ? '(' + r.es + ')' : '');
     if (v <= 5) cls += ' earn-near';
+  }
+  else if (col.k === 'sk') {
+    // 同系色（青灰）の淡いバッジ。緑=良い/赤=悪い は付けない（どちらが有利かは未検証）
+    txt = '<span class="skind ' + (v === SH_STICK ? 'k-stick' : 'k-touch') + '">' + esc(v) + '</span>';
   }
   else if (col.k === 'tb')  { txt = v; cls += ' warn'; }
   else txt = esc(v);
@@ -1400,6 +1431,8 @@ function num(id) { const v = val(id); return v === '' ? null : parseFloat(v); }
 function passes(r) {
   const mkt = val('f-mkt');
   if (mkt && r.mk !== mkt) return false;
+  const sk = val('f-sk');
+  if (sk && r.sk !== sk) return false;
   const ddmin = num('f-ddmin'), ddmax = num('f-ddmax');
   if (ddmin !== null || ddmax !== null) {
     if (r.dd === null || r.dd === undefined) return false;
@@ -1459,9 +1492,13 @@ function fillSelect(id, values, allLabel) {
     if (mcls.indexOf(m) < 0) mcls.push(m);
   });
   mkts.sort(); mcls.sort();
+  const sks = SH_KINDS.filter(function (k) {
+    return ROWS.some(function (r) { return r.sk === k; });
+  });
   fillSelect('f-mkt', mkts, 'すべて');
+  fillSelect('f-sk', sks, 'すべて');
   fillSelect('f-mcl', mcls, 'すべて');
-  ['f-mkt', 'f-ddmin', 'f-ddmax', 'f-dry', 'f-to', 'f-mcl', 'f-earn', 'f-earnd', 'f-q']
+  ['f-mkt', 'f-sk', 'f-ddmin', 'f-ddmax', 'f-dry', 'f-to', 'f-mcl', 'f-earn', 'f-earnd', 'f-q']
     .forEach(function (id) {
       const el = document.getElementById(id);
       if (el) { el.addEventListener('input', draw); el.addEventListener('change', draw); }
@@ -1483,7 +1520,7 @@ function fillSelect(id, values, allLabel) {
     ['f-ddmin', 'f-ddmax', 'f-dry', 'f-to', 'f-q'].forEach(function (id) {
       const e = document.getElementById(id); if (e) e.value = '';
     });
-    ['f-mkt', 'f-mcl'].forEach(function (id) {
+    ['f-mkt', 'f-sk', 'f-mcl'].forEach(function (id) {
       const e = document.getElementById(id); if (e) e.value = '';
     });
     const e = document.getElementById('f-earn'); if (e) e.checked = false;
@@ -1510,7 +1547,7 @@ def _row_payload(r: Dict[str, Any]) -> Dict[str, Any]:
     """層Aの1行ぶん。キーは短縮名（HTMLの肥大を抑える）。"""
     return {"rc": r["raw_code"], "c": r["code"], "n": r.get("name", ""),
             "mk": r.get("market", ""), "sec": r.get("sector", ""),
-            "sh": r.get("sh_date"), "dp": r.get("days_from_peak"),
+            "sh": r.get("sh_date"), "sk": r.get("sh_kind"), "dp": r.get("days_from_peak"),
             "dd": r.get("dd_pct"), "dry": r.get("dry_pct"), "dry5": r.get("dry5_pct"),
             "to": r.get("turnover_oku"), "p": r.get("price"), "ch": r.get("change_pct"),
             "cap": r.get("market_cap_oku"), "ed": r.get("earn_bdays"),
@@ -1578,6 +1615,8 @@ tbody tr{{cursor:pointer}} tbody tr:hover{{background:#21262d}}
 td.num{{text-align:right}} td.warn{{color:#f85149}} td.na{{color:#6e7681}}
 tr.today{{background:#13301f}}
 .dry-low{{color:#3fb950}} .earn-near{{color:#f0a020}}
+.skind{{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;white-space:nowrap}}
+.skind.k-stick{{background:#39506b;color:#cbd8e6}} .skind.k-touch{{background:#2b3440;color:#a9b4c0}}
 #card{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px;font-size:12px}}
 #card section{{border:1px solid #30363d;border-radius:6px;padding:8px 10px;background:#0d1117;min-width:0}}
 #card h3{{font-size:12px;margin:0 0 6px;color:#8b949e;font-weight:600}}
@@ -1625,6 +1664,7 @@ h2{{font-size:15px;margin:22px 0 8px}}
 
 <div id="filters">
   <label>市場 <select id="f-mkt"></select></label>
+  <label>S高種別 <select id="f-sk"></select></label>
   <label>高値からの下落率 <input type="number" id="f-ddmin" step="1" placeholder="下限"{v_ddmin}> 〜 <input type="number" id="f-ddmax" step="1" placeholder="上限"{v_ddmax}> %</label>
   <label>枯れ比 ≤ <input type="number" id="f-dry" step="5" placeholder="%"{v_dry}></label>
   <label>代金 ≥ <input type="number" id="f-to" step="0.5" placeholder="億"></label>
@@ -1646,6 +1686,9 @@ h2{{font-size:15px;margin:22px 0 8px}}
 <b>出来高枯れ比</b> = 当日出来高 ÷ S高日出来高（%）。5日平均版は 直近5日平均 ÷ S高日。分母0は「{NA}」。
 <b>高値からの日数</b> = S高日以降の最高値を最後に付けた日から当日までの営業日数（0=当日が最高値）。
 <b>代金</b> = 20日平均売買代金(億円, 当日を含む直近20本の AdjC×AdjVo 平均)。<br>
+<b>S高種別</b> = S高日の終値が当日高値と同値なら「{SH_STICK}」、下回れば「{SH_TOUCH}」（生値の H/C で判定）。
+<code>UL</code> は上限に<b>触れた</b>フラグで、引けまで買われ続けたことを意味しない。
+どちらが有利かは<b>未検証</b>なので、並び順・抽出条件には使っていない【推測】。<br>
 <b>決算まで</b> = 手入力 <code>manual/&lt;code&gt;.yaml</code> の <code>earnings_date</code> が主。
 <code>/equities/earnings-calendar</code> は<b>翌営業日発表分しか返さない限定フィード</b>（date/from/to/code を無視する・実測）なので、
 <b>空欄は「発表予定なし」を意味しない</b>。営業日数は土日のみ考慮で祝日未対応（多めに出る）。<br>
@@ -1667,6 +1710,8 @@ const DATA = {data_js};
 const ROWS = {rows_js};
 const TARGET = "{target}";
 const MATERIAL_UNSET = "{MATERIAL_UNSET}";
+const SH_STICK = "{SH_STICK}";
+const SH_KINDS = {_json_script(SH_KINDS)};
 const NA = "{NA}";
 const DECISIONS = {dec_js};
 const DECISION_HOLD = {DECISION_HOLD};
