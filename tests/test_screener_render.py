@@ -371,7 +371,7 @@ def test_manual_material_class_and_earnings():
     assert by["1301"]["material_class"] == "上方修正"
     assert by["1301"]["earn_date"] == "2026-09-18" and by["1301"]["earn_src"] == "確定"
     assert by["1301"]["earn_bdays"] == 5
-    assert by["338A"]["earn_src"] == "推定", "confirmed が無ければ推定"
+    assert by["338A"]["earn_src"] == "推定", "手入力で confirmed が無ければ推定"
     assert by["9997"]["material_class"] == sc.MATERIAL_UNSET
     assert by["9997"]["earn_date"] is None and by["9997"]["earn_bdays"] is None
 
@@ -379,7 +379,7 @@ def test_manual_material_class_and_earnings():
 def test_earnings_calendar_is_fallback_only():
     recs, _ = build_records(ecal={"13010": "2026-09-14", "99970": "2026-09-15"})
     by = {r["code"]: r for r in recs}
-    assert by["1301"]["earn_src"] == "API" and by["1301"]["earn_date"] == "2026-09-14"
+    assert by["1301"]["earn_src"] == "推定(API)" and by["1301"]["earn_date"] == "2026-09-14"
     assert by["9997"]["earn_bdays"] == 2
     assert by["338A"]["earn_date"] is None
 
@@ -396,7 +396,23 @@ def test_manual_wins_over_earnings_calendar():
         shutil.rmtree(d)
     by = {r["code"]: r for r in recs}
     assert by["1301"]["earn_date"] == "2026-10-15" and by["1301"]["earn_src"] == "確定"
-    assert by["338A"]["earn_date"] == "2026-09-14" and by["338A"]["earn_src"] == "API"
+    assert by["338A"]["earn_date"] == "2026-09-14" and by["338A"]["earn_src"] == "推定(API)"
+
+
+def test_price_comes_from_adjusted_series():
+    """画面の株価も調整済み終値。判断ログの決済が AdjC なので食い違わせない。"""
+    bars = synth_bars("13010", sh_offset=8)
+    for r in bars:                      # 生値だけ 2倍にして、どちらを拾っているか判る形にする
+        r["C"] = r["AdjC"] * 2
+    jq = FakeJQ({"13010": bars})
+    item = {"code": "13010", "close": bars[-1]["C"], "change_pct": 0.0, "stop_high": False,
+            "volume": bars[-1]["Vo"],
+            "sh_date": [r["Date"] for r in bars if r["UL"] == "1"][-1],
+            "sh_vol": None, "sh_close": None, "date_target": TARGET}
+    rec = sc.analyze_candidate(jq, item, {"13010": "あ"}, {"13010": "グロース"},
+                               dict(sc.DEFAULT_CRITERIA))
+    assert abs(rec["price"] - round(bars[-1]["AdjC"], 1)) < 0.05, \
+        f"生値 {bars[-1]['C']} ではなく調整済み {bars[-1]['AdjC']} を出す: {rec['price']}"
 
 
 def test_change_pct_uses_adjusted_series_not_raw_bulk_close():

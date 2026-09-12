@@ -164,12 +164,17 @@ def test_sector_comove():
     sec = {"A": "情報・通信業", "B": "情報・通信業", "C": "情報・通信業", "D": "電気機器"}
     chg = {"A": 5.0, "B": 1.0, "C": 3.0, "D": 9.0}
     r = sc.sector_comove("A", sec, chg)
-    assert r["name"] == "情報・通信業" and r["hot"] == 2 and r["total"] == 3
+    # 自分(A)は分子にも母数にも入れない → 残るのは B(1.0%) と C(3.0%)
+    assert r["name"] == "情報・通信業" and r["hot"] == 1 and r["total"] == 2
+    assert sc.sector_comove("B", sec, chg)["hot"] == 2, "A と C が +3%以上"
+    solo = sc.sector_comove("D", sec, chg)
+    assert solo["hot"] is None and solo["total"] is None, "同業種が自分だけなら—"
     assert sc.sector_comove("Z", sec, chg)["hot"] is None, "業種不明は—"
     assert sc.sector_comove("A", sec, {})["hot"] is None, "当日の騰落が無ければ—"
 
 
 def test_past_sh_episodes():
+    """完了したエピソードだけ / 最大押しは「その時点までの高値からの下押し」/ 5日後は押し目起点。"""
     n = 120
     dates = [f"d{i:03d}" for i in range(n)]
     highs = [100.0] * n
@@ -179,15 +184,78 @@ def test_past_sh_episodes():
     uls[11] = True                 # 直後の連続S高は同一エピソードにまとめる
     uls[n - 5] = True              # 進行中（結果が出ていない）
     highs[10] = 150.0
-    for i in range(11, 31):
-        closes[i] = 120.0
-    closes[15] = 90.0              # 最大押し
-    closes[10], closes[15] = 140.0, 90.0
+    closes[10] = 140.0
+    closes[15] = 90.0              # 最大押し（d015）
+    closes[20] = 117.0             # その5営業日後 → +30%
     eps = sc.past_sh_episodes(dates, highs, closes, uls)
     assert [e["d"] for e in eps] == ["d010"], "進行中のエピソードは出さない"
     assert abs(eps[0]["dd"] - (90.0 / 150.0 - 1) * 100) < 1e-9
-    assert eps[0]["r5"] is not None
+    assert eps[0]["dd_date"] == "d015", "最大押しをつけた日も返す"
+    assert abs(eps[0]["r5"] - (117.0 / 90.0 - 1) * 100) < 1e-9, "5営業日後は最大押し起点"
     assert sc.past_sh_episodes(dates, highs, closes, [False] * n) == []
+
+
+def test_past_sh_episodes_drawdown_needs_peak_before_trough():
+    """安値が高値より前にある場合、起きていない下落を作らない。"""
+    n = 60
+    dates = [f"d{i:03d}" for i in range(n)]
+    highs = [100.0] * n
+    closes = [100.0] * n
+    uls = [False] * n
+    uls[5] = True
+    closes[6] = 50.0               # S高直後に安値
+    highs[15] = 500.0              # そのあとで高値
+    closes[15] = 500.0
+    for i in range(16, n):
+        closes[i] = 500.0          # 高値のあとは下げない
+    eps = sc.past_sh_episodes(dates, highs, closes, uls)
+    assert len(eps) == 1
+    # 素朴な min(closes)/max(highs)-1 なら -90%。実際に起きた最大の下押しは -50%（d006）
+    assert abs(eps[0]["dd"] - (50.0 / 100.0 - 1) * 100) < 1e-9, eps[0]
+    assert eps[0]["dd_date"] == "d006"
+
+
+def test_past_sh_episodes_chain_does_not_swallow_independent_episodes():
+    """gap 未満の間隔が続いても、エピソード開始から gap を超えたら別エピソードにする。"""
+    n = 120
+    dates = [f"d{i:03d}" for i in range(n)]
+    highs = [100.0] * n
+    closes = [100.0] * n
+    uls = [False] * n
+    for i in (10, 25, 40, 55):     # 直前からは常に15本（gap=20未満）
+        uls[i] = True
+    eps = sc.past_sh_episodes(dates, highs, closes, uls)
+    assert [e["d"] for e in eps] == ["d010", "d040"], \
+        "開始から20本を超えた d040 は別エピソード（直前比で数えると1件に潰れる）"
+
+
+def test_past_sh_episodes_ragged_input_does_not_raise():
+    dates = [f"d{i:03d}" for i in range(50)]
+    assert sc.past_sh_episodes(dates, [100.0] * 50, [100.0] * 50, [False] * 3) == []
+
+
+def test_parse_margin_skips_gap_week_for_delta():
+    """週が抜けていたら「前週比」を出さない（黙って2週分にしない）。"""
+    rows = [dict(MARGIN_ROWS[0], Date="2026-08-14"),
+            dict(MARGIN_ROWS[1], Date="2026-08-28")]      # 2週空き
+    ws = sc.parse_margin(rows)
+    assert ws[-1]["d_long"] is None and ws[-1]["d_ratio"] is None
+    ws2 = sc.parse_margin([dict(MARGIN_ROWS[0], Date="2026-08-21"),
+                           dict(MARGIN_ROWS[1], Date="2026-08-28")])
+    assert ws2[-1]["d_long"] == 400000.0, "ちょうど1週なら出す"
+
+
+def test_dip_volume_split_ignores_unchanged_days():
+    closes = [100.0, 130.0, 130.0, 120.0, 120.0, 125.0]
+    vols = [10.0, 900.0, 111.0, 300.0, 222.0, 60.0]
+    r = sc.dip_volume_split(closes, vols, sh_idx=1)
+    assert r["down_n"] == 1 and r["down_avg"] == 300.0
+    assert r["up_n"] == 1 and r["up_avg"] == 60.0, "前日比0の日はどちらにも数えない"
+
+
+def test_fetch_margin_bad_target_is_a_reason_not_an_exception():
+    ws, reason = sc.fetch_margin(MarginJQ(), "13010", "2026/09/11")
+    assert ws == [] and "書式" in reason
 
 
 # ----------------------------------------------------------------------
@@ -219,7 +287,7 @@ def test_card_payload_is_populated():
     assert c["vol_split"]["down_n"] > 0
     assert "MA" in c["pos"] and "高値" in c["pos"]
     assert c["sector"]["name"] == "情報・通信業"
-    assert c["sector"]["hot"] == 1 and c["sector"]["total"] == 2
+    assert c["sector"]["hot"] == 1 and c["sector"]["total"] == 1, "自分(13010)を除いた 99970 だけが母数"
     assert c["funda"]["eqar"] is not None and c["funda"]["stop_loss"] is not None
     assert c["margin"]["float_pct"] is None, "浮動株が未入力なら出さない"
 

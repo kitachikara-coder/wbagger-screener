@@ -285,3 +285,144 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+# ----------------------------------------------------------------------
+# 反証レビューで見つかった穴（2026-09-12 追加）
+# ----------------------------------------------------------------------
+def _copy_row_text(action="buy", price=100.0, reason="25MA到達", date=TARGET, code="1301"):
+    """カードの「JSON行をコピー」が吐くのと同じ文字列を Python 側で再現する。
+
+    JS 側は JSON.stringify(row) なので、キー順とエスケープは json.dumps と同じ。
+    """
+    row = {"date": date, "code": code, "action": action, "reason": reason}
+    if price is not None:
+        row["price"] = price
+    return json.dumps(row, ensure_ascii=False)
+
+
+def test_copy_row_pastes_into_empty_array_and_loads_back():
+    """コピー行を空配列の中に貼って読み戻せること（末尾カンマを付けると壊れる）。"""
+    d = tempfile.mkdtemp()
+    try:
+        p = os.path.join(d, "decisions.json")
+        text = _copy_row_text()
+        assert not text.endswith(","), "末尾カンマを付けない（配列末尾に貼ると不正JSONになる）"
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{\n  "decisions": [\n    ' + text + '\n  ]\n}\n')
+        got = sc.load_decisions(p)
+        assert len(got) == 1
+        assert got[0]["code"] == "1301" and got[0]["action"] == "buy"
+        assert got[0]["price"] == 100.0 and got[0]["reason"] == "25MA到達"
+        assert sc.DEC_ERR["msg"] == ""
+    finally:
+        shutil.rmtree(d)
+
+
+def test_copy_row_pastes_before_existing_rows():
+    """既存行がある配列の先頭に貼る手順（貼った行の末尾にカンマを足す）でも読める。"""
+    d = tempfile.mkdtemp()
+    try:
+        p = os.path.join(d, "decisions.json")
+        a, b = _copy_row_text(code="1301"), _copy_row_text(code="9997", date="2026-09-04")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"decisions": [' + a + ',' + b + ']}')
+        got = sc.load_decisions(p)
+        assert [r["code"] for r in got] == ["9997", "1301"]
+    finally:
+        shutil.rmtree(d)
+
+
+def test_broken_json_is_surfaced_on_the_page():
+    """壊れたJSONは画面に赤字で出す（Actions のログにだけ出して黙らせない）。"""
+    d = tempfile.mkdtemp()
+    try:
+        p = os.path.join(d, "decisions.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"decisions": [' + _copy_row_text() + ',]}')   # 末尾カンマ＝不正
+        assert sc.load_decisions(p) == []
+        assert sc.DEC_ERR["msg"] and "decisions.json" in sc.DEC_ERR["msg"]
+        recs, _ = build_records()
+        out = tempfile.mkdtemp()
+        try:
+            sc.render(TARGET, recs, dict(sc.DEFAULT_CRITERIA), docs=out,
+                      decisions=[], dec_error=sc.DEC_ERR["msg"])
+            with open(os.path.join(out, "index.html"), encoding="utf-8") as f:
+                html = f.read()
+        finally:
+            shutil.rmtree(out)
+        assert "DECISION_ERROR" in html and "読めませんでした" in html
+        assert "⚠ ' + esc(DECISION_ERROR)" in html
+    finally:
+        sc.DEC_ERR["msg"] = ""
+        shutil.rmtree(d)
+
+
+def test_decision_older_than_series_is_not_settled():
+    """判断日が日足の取得範囲より前なら、系列の先頭で勝手に決済しない。"""
+    dec = {"date": "2024-01-05", "code": "1234", "price": 100.0}
+    o = sc.settle_decision(dec, DATES, CLOSES, TARGET, hold=5)
+    assert o["status"] == "unknown", "1年半前の判断を直近の値動きで確定させない"
+    assert "取得範囲より前" in o["reason"]
+    assert o["pnl_pct"] is None and o["exit_date"] is None
+
+
+def test_stale_series_is_not_settled():
+    """日足が基準日より古ければ、経過待ちの残り日数が狂うので確定させない。"""
+    o = sc.settle_decision({"date": "2026-09-02", "code": "1234", "price": 102.0},
+                           DATES[:-2], CLOSES[:-2], TARGET, hold=5)
+    assert o["status"] == "unknown" and "古い" in o["reason"]
+
+
+def test_fetch_priority_is_newest_decision_first():
+    """取得の上限で切るとき、新しい判断の銘柄が先に取れること。"""
+    sc.REQ["n"] = 0
+    rows = [{"Date": d, "AdjC": c} for d, c in zip(DATES, CLOSES)]
+    jq = CountingJQ({c: rows for c in ("1111", "2222", "3333")})
+    decs = [{"date": "2026-09-01", "code": "1111", "action": "buy", "reason": "", "price": 100.0},
+            {"date": "2026-09-02", "code": "2222", "action": "buy", "reason": "", "price": 100.0},
+            {"date": "2026-09-03", "code": "3333", "action": "buy", "reason": "", "price": 100.0}]
+    out = sc.settle_decisions(jq, decs, {}, TARGET, max_fetch=1)
+    asked = [p["code"] for _, p in jq.calls]
+    assert asked == ["3333"], f"最も新しい判断の銘柄を先に取る: {asked}"
+    by = {o["code"]: o["outcome"] for o in out}
+    assert by["3333"]["status"] == "done"
+    assert "上限" in by["1111"]["reason"] and "上限" in by["2222"]["reason"]
+
+
+def test_fetch_error_reason_differs_from_no_data():
+    """取得失敗と「日足なし（未上場・上場廃止）」を取り違えない。"""
+    class Boom(CountingJQ):
+        def get(self, path, params=None):
+            self.calls.append((path, dict(params or {})))
+            raise RuntimeError("HTTP 500")
+    out = sc.settle_decisions(Boom({}), [{"date": "2026-09-02", "code": "9999",
+                                          "action": "buy", "reason": "", "price": 100.0}],
+                              {}, TARGET)
+    assert out[0]["outcome"]["status"] == "unknown"
+    assert "取得に失敗" in out[0]["outcome"]["reason"]
+
+
+def test_skip_decision_is_not_coloured_as_good_or_bad():
+    recs, _ = build_records()
+    decs = sc.settle_decisions(CountingJQ({}),
+                               [{"date": "2026-09-02", "code": "1301", "action": "skip",
+                                 "reason": "決算跨ぎ", "price": 102.0}],
+                               {"1301": (DATES, CLOSES)}, TARGET)
+    d = tempfile.mkdtemp()
+    try:
+        sc.render(TARGET, recs, dict(sc.DEFAULT_CRITERIA), docs=d, decisions=decs)
+        with open(os.path.join(d, "index.html"), encoding="utf-8") as f:
+            html = f.read()
+    finally:
+        shutil.rmtree(d)
+    assert "(action === 'skip') ? 'muted'" in html
+    assert "見送り後の値動き" in html
+
+
+def test_decision_date_is_editable():
+    recs, _ = build_records()
+    html, _ = render_to_tmp(recs)
+    assert 'id="d-date"' in html and 'type="date"' in html
+    assert "(dateEl && dateEl.value) ? dateEl.value : TARGET" in html
+    assert "const text = JSON.stringify(row);" in html, "末尾カンマを付けない"

@@ -348,6 +348,40 @@ def test_build_shortlist_drops_codes_without_today_bar():
     assert c["stop_high"] is True and c["sh_date"] == target
 
 
+def test_change_pct_is_adjustment_corrected():
+    """権利落ち・分割を跨いだ日の前日比を生値同士で出さない。
+
+    実測(2026-09-11 / 14470): 生値 C 同士だと -3.51% だが、正しい前日比は +44.65%。
+    当日行の AdjFactor で前日終値を割り戻すと +44.63% になる。
+    """
+    target, prev = "2026-09-11", "2026-09-10"
+    by_date = {
+        target: [{"Code": "14470", "C": 357.0, "UL": "0", "Vo": 1.0,
+                  "AdjFactor": 0.6671171171171171},
+                 {"Code": "A0", "C": 110.0, "UL": "0", "Vo": 1.0, "AdjFactor": 1.0},
+                 {"Code": "B0", "C": 110.0, "UL": "0", "Vo": 1.0}],          # AdjFactor 欠損
+        prev: [{"Code": "14470", "C": 370.0}, {"Code": "A0", "C": 100.0},
+               {"Code": "B0", "C": 100.0}],
+    }
+    sh_map = {c: {"sh_date": prev, "sh_vol": 1.0, "sh_close": 1.0}
+              for c in ("14470", "A0", "B0")}
+    _, chg = sc.build_shortlist(FakeJQ(by_date), target, prev, set(sh_map),
+                                sh_map, dict(sc.DEFAULT_CRITERIA))
+    assert abs(chg["14470"] - 44.63) < 0.02, f"生値同士なら -3.51% になる: {chg['14470']}"
+    assert abs(chg["A0"] - 10.0) < 1e-9, "調整なしの日は従来どおり"
+    assert abs(chg["B0"] - 10.0) < 1e-9, "AdjFactor 欠損は 1.0 とみなす"
+
+
+def test_change_pct_excluded_when_factor_unusable():
+    target, prev = "2026-09-11", "2026-09-10"
+    by_date = {target: [{"Code": "A0", "C": 110.0, "UL": "0", "AdjFactor": 0.0}],
+               prev: [{"Code": "A0", "C": 100.0}]}
+    sh_map = {"A0": {"sh_date": prev, "sh_vol": 1.0, "sh_close": 1.0}}
+    _, chg = sc.build_shortlist(FakeJQ(by_date), target, prev, {"A0"}, sh_map,
+                                dict(sc.DEFAULT_CRITERIA))
+    assert "A0" not in chg, "調整係数が0なら数字を作らずセクター母数から外す"
+
+
 def test_market_universe_returns_sector_for_all_codes():
     jq = FakeJQ(by_path={"/equities/master": [
         {"Code": "A0", "CoName": "あ", "MktNm": "グロース", "S33Nm": "情報･通信業"},

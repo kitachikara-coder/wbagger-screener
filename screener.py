@@ -503,11 +503,18 @@ def parse_margin(rows: List[Dict[str, Any]], weeks: int = 3) -> List[Dict[str, A
                     "neg_pct": (neg / lv * 100) if (neg is not None and lv) else None,
                     "d_long": None, "d_ratio": None})
     for i in range(1, len(out)):
-        p, c = out[i - 1], out[i]
-        if c["long"] is not None and p["long"] is not None:
-            c["d_long"] = c["long"] - p["long"]
-        if c["ratio"] is not None and p["ratio"] is not None:
-            c["d_ratio"] = c["ratio"] - p["ratio"]
+        prev_w, cur = out[i - 1], out[i]
+        # 週が抜けていたら「前週比」と呼べないので出さない（黙って2週分を前週比にしない）
+        try:
+            gap = (dt.date.fromisoformat(cur["date"]) - dt.date.fromisoformat(prev_w["date"])).days
+        except ValueError:
+            continue
+        if gap != 7:
+            continue
+        if cur["long"] is not None and prev_w["long"] is not None:
+            cur["d_long"] = cur["long"] - prev_w["long"]
+        if cur["ratio"] is not None and prev_w["ratio"] is not None:
+            cur["d_ratio"] = cur["ratio"] - prev_w["ratio"]
     return out
 
 
@@ -521,9 +528,12 @@ def fetch_margin(jq: JQuants, code: str, target: Optional[str] = None,
     """
     params: Dict[str, Any] = {"code": code}
     if target:
-        frm = (dt.datetime.strptime(target, "%Y-%m-%d").date()
-               - dt.timedelta(days=30 * (weeks + 2))).strftime("%Y-%m-%d")
-        params.update({"from": frm, "to": target})
+        try:
+            frm = (dt.datetime.strptime(target, "%Y-%m-%d").date()
+                   - dt.timedelta(days=30 * (weeks + 2))).strftime("%Y-%m-%d")
+            params.update({"from": frm, "to": target})
+        except ValueError:
+            return [], "取得失敗(基準日の書式が不正)"
     try:
         rows = api(jq, "/markets/margin-interest", params)
     except requests.HTTPError as e:
@@ -568,7 +578,11 @@ def dip_volume_split(closes: List[Optional[float]], vols: List[Optional[float]],
         c, p, v = closes[i], closes[i - 1], vols[i]
         if c is None or p is None or v is None:
             continue
-        (up if c >= p else down).append(v)
+        if c > p:
+            up.append(v)
+        elif c < p:
+            down.append(v)
+        # 前日比ちょうど0の日は「下落日」でも「反発日」でもないので数えない
     if down:
         out["down_avg"], out["down_n"] = sum(down) / len(down), len(down)
     if up:
@@ -599,7 +613,9 @@ def sector_comove(code: str, sec: Dict[str, str], chg_all: Dict[str, float],
     out = {"name": name, "hot": None, "total": None, "thr": thr}
     if not name:
         return out
-    peers = [c for c, s in sec.items() if s == name and c in chg_all]
+    # 自分自身は分子にも母数にも入れない（S高銘柄は必ず上昇側なので、入れると必ず1本水増しされる）
+    peers = [c for c, sname in sec.items()
+             if sname == name and c in chg_all and c != code]
     if not peers:
         return out
     out["total"] = len(peers)
@@ -610,32 +626,49 @@ def sector_comove(code: str, sec: Dict[str, str], chg_all: Dict[str, float],
 def past_sh_episodes(dates: List[str], highs: List[Optional[float]],
                      closes: List[Optional[float]], uls: List[bool],
                      gap: int = 20, fwd: int = 5, limit: int = 6) -> List[Dict[str, Any]]:
-    """同一銘柄の過去のS高エピソード（S高日 → 最大押し → その後5営業日の騰落）。
+    """同一銘柄の過去のS高エピソード（S高日 → 最大押し → 最大押しから fwd 営業日後の騰落）。
 
-    **参考表示のみ。予測には使わない。** 直近 gap 本に入るエピソード（＝今回の分）は
-    まだ結果が出ていないので除く。連続したS高は gap 本以内なら1エピソードにまとめる。
+    **参考表示のみ。予測には使わない。**
+
+    - 最大押しは **その時点までの最高値からの下押し** を走査して最悪値を採る。
+      単に「期間の最安値 ÷ 期間の最高値」にすると、安値が高値より**前**にある場合に
+      起きていない下落を作ってしまう
+    - その後の騰落は **最大押しをつけた日を起点**に fwd 営業日後の終値で測る
+      （「押したあと戻ったか」を見たいので、S高日起点ではない）
+    - 連続したS高は **エピソード開始から gap 本以内**なら同じエピソードとして扱う
+      （直前のS高からの間隔で数えると、gap 未満の間隔が続く銘柄が永久に1エピソードになる）
+    - 直近 gap 本に入るエピソード（＝進行中の分）はまだ結果が出ていないので出さない
     """
-    n = len(dates)
+    n = min(len(dates), len(highs), len(closes), len(uls))
     eps: List[Dict[str, Any]] = []
-    last = None
+    start = None
     for i in range(n):
         if not uls[i]:
             continue
-        if last is not None and i - last < gap:
-            last = i
-            continue
-        last = i
+        if start is not None and i - start < gap:
+            continue                     # 同一エピソード内の連続S高（start は更新しない）
+        start = i
         if i >= n - gap:                 # 進行中のエピソードは結果が確定していない
             continue
-        hs = [h for h in highs[i:i + gap + 1] if h is not None]
-        cs = [c for c in closes[i:i + gap + 1] if c is not None]
-        peak = max(hs) if hs else None
-        trough = min(cs) if cs else None
-        c0 = closes[i]
-        cf = closes[i + fwd] if i + fwd < n else None
-        eps.append({"d": dates[i],
-                    "dd": ((trough / peak - 1) * 100) if (peak and trough) else None,
-                    "r5": ((cf / c0 - 1) * 100) if (c0 and cf) else None})
+        peak, dd, dd_idx = None, None, None
+        for k in range(i, min(n, i + gap + 1)):
+            h = highs[k]
+            if h is not None and (peak is None or h > peak):
+                peak = h
+            c = closes[k]
+            if peak and c is not None:
+                cur = (c / peak - 1) * 100
+                if dd is None or cur < dd:
+                    dd, dd_idx = cur, k
+        r = None
+        if dd_idx is not None:
+            c0 = closes[dd_idx]
+            j = dd_idx + fwd
+            cf = closes[j] if j < n else None
+            if c0 and cf:
+                r = (cf / c0 - 1) * 100
+        eps.append({"d": dates[i], "dd": dd,
+                    "dd_date": dates[dd_idx] if dd_idx is not None else None, "r5": r})
     return eps[-limit:]
 
 
@@ -643,6 +676,8 @@ def past_sh_episodes(dates: List[str], highs: List[Optional[float]],
 # P3: 判断ログ（買う / 見送り を自分で記録し、5営業日後の実績と突き合わせる）
 # ----------------------------------------------------------------------
 DECISIONS_REL = os.path.join("data", "decisions.json")
+# 直近の読み込みで起きた不具合（画面に赤字で出す。Actions のログだけに出して黙らせない）
+DEC_ERR = {"msg": ""}
 DECISION_HOLD = 5          # 突合する営業日数
 DECISION_MAX_FETCH = 30    # 当日の候補に居ないコードを追加取得する上限（超えた分は理由を出す）
 
@@ -653,16 +688,21 @@ def load_decisions(path: Optional[str] = None) -> List[Dict[str, Any]]:
     1件ずつ検証し、date と code が読めない行だけを捨てる（1行の書き損じで全部を失わない）。
     """
     path = path or os.path.join(DOCS_DIR, DECISIONS_REL)
+    DEC_ERR["msg"] = ""
     if not os.path.exists(path):
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception as e:
+        DEC_ERR["msg"] = (f"decisions.json を読めませんでした（{e}）。"
+                          f"貼った行のカンマ抜け・余分なカンマを確認すること。"
+                          f"直るまで判断ログは全件表示されません")
         print(f"[warn] {path} が読めません({e})。判断ログは空として続行します")
         return []
     items = raw.get("decisions") if isinstance(raw, dict) else raw
     if not isinstance(items, list):
+        DEC_ERR["msg"] = "decisions.json の decisions が配列ではありません"
         print(f"[warn] {path} の decisions が配列ではありません。判断ログは空として続行します")
         return []
     out, bad = [], 0
@@ -679,6 +719,7 @@ def load_decisions(path: Optional[str] = None) -> List[Dict[str, Any]]:
                     "reason": str(r.get("reason") or "").strip(),
                     "price": fnum(r.get("price"))})
     if bad:
+        DEC_ERR["msg"] = f"判断ログの {bad}件は date か code が読めないため無視しました"
         print(f"[warn] 判断ログの {bad}件は date/code が読めないため無視しました")
     out.sort(key=lambda r: (r["date"], r["code"]))
     return out
@@ -689,6 +730,8 @@ def settle_decision(dec: Dict[str, Any], dates: List[str], closes: List[Optional
     """判断日の hold 営業日後の終値と price を比べる。日足は昇順・調整済みを渡すこと。
 
     - 判断日が休場なら「その日以降で最初の営業日」を起点にする
+    - **判断日が系列の左端より前なら unknown**。系列の先頭で決済すると、1年前の判断を
+      直近の値動きで「実績確定」にしてしまう
     - hold 営業日ぶんのバーがまだ無ければ「経過待ち」（残り日数つき）
     - price が無ければ起点日の終値を建値とみなす（見送りの記録で price を省けるように）
     """
@@ -696,6 +739,12 @@ def settle_decision(dec: Dict[str, Any], dates: List[str], closes: List[Optional
            "exit_date": None, "exit": None, "pnl_pct": None, "left": None, "reason": ""}
     if not dates:
         out["reason"] = "日足なし"
+        return out
+    if dec["date"] < dates[0]:
+        out["reason"] = f"判断日が日足の取得範囲より前（{dates[0]} 以降しか無い）"
+        return out
+    if today and dates[-1] < today:
+        out["reason"] = f"日足が古い（最終 {dates[-1]}／基準日 {today}）"
         return out
     i = next((k for k, d in enumerate(dates) if d >= dec["date"]), None)
     if i is None:
@@ -731,8 +780,14 @@ def settle_decisions(jq: JQuants, decisions: List[Dict[str, Any]],
 
     追加取得は max_fetch 件まで。打ち切った分は結果に理由を残す（黙って落とさない）。
     """
-    need = sorted({d["code"] for d in decisions if d["code"] not in series_by_code})
-    fetched, skipped = 0, []
+    # 取得の優先順位は「その銘柄で最も新しい判断日」の降順。コード文字列順で切ると、
+    # 記録が増えたとき新しい判断がいつまでも実績待ちのまま残る
+    latest: Dict[str, str] = {}
+    for d in decisions:
+        if d["code"] not in series_by_code:
+            latest[d["code"]] = max(latest.get(d["code"], ""), d["date"])
+    need = sorted(latest, key=lambda c: (latest[c], c), reverse=True)
+    fetched, skipped, failed = 0, [], {}
     frm = (dt.datetime.strptime(target, "%Y-%m-%d").date()
            - dt.timedelta(days=400)).strftime("%Y-%m-%d")
     for code in need:
@@ -742,7 +797,9 @@ def settle_decisions(jq: JQuants, decisions: List[Dict[str, Any]],
         try:
             rows = api(jq, "/equities/bars/daily", {"code": code, "from": frm, "to": target})
         except Exception as e:
+            failed[code] = f"日足の取得に失敗({type(e).__name__})"
             print(f"  [warn] 判断ログ {code} の日足取得に失敗: {e}")
+            fetched += 1                 # 失敗も1回ぶん数える（毎日ここで詰まらないように）
             continue
         rows = [r for r in rows if fnum(r.get("AdjC")) is not None]
         rows.sort(key=lambda r: r.get("Date", ""))
@@ -756,10 +813,12 @@ def settle_decisions(jq: JQuants, decisions: List[Dict[str, Any]],
     for d in decisions:
         dates, closes = series_by_code.get(d["code"], ([], []))
         r = dict(d)
-        if not dates and d["code"] in skipped:
-            r["outcome"] = {"status": "unknown", "reason": f"追加取得の上限({max_fetch})超過",
-                            "base_date": None, "entry": None, "exit_date": None,
-                            "exit": None, "pnl_pct": None, "left": None}
+        blank = {"status": "unknown", "base_date": None, "entry": None, "exit_date": None,
+                 "exit": None, "pnl_pct": None, "left": None}
+        if d["code"] in skipped:
+            r["outcome"] = dict(blank, reason=f"追加取得の上限({max_fetch})超過")
+        elif d["code"] in failed:
+            r["outcome"] = dict(blank, reason=failed[d["code"]])
         else:
             r["outcome"] = settle_decision(d, dates, closes, target)
             if isinstance(r["outcome"].get("pnl_pct"), float):
@@ -782,11 +841,17 @@ def build_shortlist(jq: JQuants, target: str, prev: str, uni_codes: set,
     """
     cur = {r["Code"]: r for r in bars_by_date(jq, target, cache)}
     prv = {r["Code"]: r for r in bars_by_date(jq, prev, cache)}
+    # 前日比は権利落ち・分割を跨ぐと生値同士では出せない。当日行の AdjFactor で前日終値を
+    # 割り戻す（2026-09-11 の 14470 で実測: 生値 -3.51% / 正しくは +44.65% / 本式 +44.63%）。
+    # AdjFactor が取れない行はセクター連動の母数から外す（推測で数字を作らない）。
     chg_all: Dict[str, float] = {}
     for code, row in cur.items():
         c, p = fnum(row.get("C")), fnum(prv.get(code, {}).get("C"))
-        if c is not None and p:
-            chg_all[code] = (c - p) / p * 100
+        af = fnum(row.get("AdjFactor"))
+        if af is None:
+            af = 1.0 if row.get("AdjFactor") is None else None
+        if c is not None and p and af:
+            chg_all[code] = (c / (p * af) - 1) * 100
 
     shortlist, dropped = [], 0
     for code, sh in sh_map.items():
@@ -904,8 +969,9 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         rec["earn_date"] = m_ed.isoformat()
         rec["earn_src"] = "確定" if manual.get("earnings_date_confirmed") else "推定"
     elif (ecal or {}).get(code):
+        # 契約 P2:「YAML優先 → なければ earnings-calendar（"推定" と明示）」
         rec["earn_date"] = ecal[code]
-        rec["earn_src"] = "API"
+        rec["earn_src"] = "推定(API)"
     rec["earn_bdays"] = days_to_earnings(rec["earn_date"], today)
 
     frm = (today - dt.timedelta(days=760)).strftime("%Y-%m-%d")
@@ -935,6 +1001,10 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
 
     # 前日比は調整済み系列から出し直す。日付一括の生値 C 同士で割ると、
     # 権利落ち日に「動いていないのに -50%」が出る（本体 kabu-monitor で実害の記録あり）
+    if closes and closes[-1] is not None:
+        # 株価も調整済みに揃える。判断ログの決済が AdjC なので、画面の値をそのまま
+        # 建値に写して損益が壊れる、という食い違いを作らない
+        rec["price"] = round(closes[-1], 1)
     if len(closes) >= 2 and closes[-1] is not None and closes[-2]:
         rec["change_pct"] = round((closes[-1] / closes[-2] - 1) * 100, 2)
 
@@ -1012,8 +1082,9 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         "continuity": str(manual.get("continuity") or "").strip(),
         "note": str(manual.get("note") or "").strip(),
         "earn": {"date": rec["earn_date"], "src": rec["earn_src"], "bdays": rec["earn_bdays"]},
-        "margin": {"weeks": [{k: (r2(v, 3) if isinstance(v, float) else v)
-                              for k, v in w.items()} for w in mweeks],
+        "margin": {"weeks": [{k: (r2(w[k], 3) if isinstance(w[k], float) else w[k])
+                              for k in ("date", "long", "short", "ratio", "d_long", "d_ratio")}
+                             for w in mweeks],
                    "reason": mreason, "float_pct": r2(float_pct, 1)},
         "vol_profile": [{"d": p["d"], "pct": r2(p["pct"], 1), "sh": p["sh"]}
                         for p in volume_profile(dates, vols, sh_idx)],
@@ -1026,10 +1097,8 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         "funda": {"eqar": rec["equity_ratio"], "opm": rec["op_margin"], "roe": rec["roe"],
                   "trend": rec["profit_trend"], "cap": rec["market_cap_oku"],
                   "volx": rec["volume_x"], "po": rec["ma_perfect_order"],
-                  "macd": rec["macd_cross"], "stop_loss": rec["stop_loss"],
-                  "turnover": rec["turnover_oku"]},
+                  "macd": rec["macd_cross"], "stop_loss": rec["stop_loss"]},
         "taboo": rec["taboo_reason"], "taboo_hit": rec["taboo_hit"],
-        "sh_date": rec["sh_date"], "sh_vol": rec["sh_vol"],
     }
     rec["_series"] = (dates, closes)     # 判断ログの突合で使い回す（追加API 0）。latest.json には出さない
     return rec
@@ -1185,13 +1254,15 @@ function secMargin(c) {
     const last = ws[ws.length - 1];
     h += kv('信用倍率 前週比', sv(last.d_ratio, 2, '倍'));
     if (m.float_pct !== null && m.float_pct !== undefined) {
-      h += kv('買残÷浮動株', m.float_pct.toFixed(1) + '%',
-              m.float_pct >= 25 ? 'warn' : m.float_pct >= 10 ? 'warn' : '');
+      h += kv('買残÷浮動株', m.float_pct.toFixed(1) + '%'
+              + (m.float_pct >= 25 ? ' ⚠強' : m.float_pct >= 10 ? ' ⚠' : ''),
+              m.float_pct >= 10 ? 'warn' : '');
     }
   }
   h += '<div class="ref">信用倍率＝買残÷売残。<b>日証金の貸借倍率とは別物</b>（日証金分はJ-Quants非配信）。'
-     + '買残÷浮動株は浮動株を手入力した銘柄だけ（10%超で警告色）。'
-     + '週次データは基準日の翌週に公表されるので、当日の需給ではない。</div>';
+     + '買残÷浮動株は浮動株を手入力した銘柄だけ（<b>10%以上で⚠・25%以上で⚠強</b>）。'
+     + '週次データは基準日の翌週に公表されるので、当日の需給ではない。'
+     + '「前週比」は1週ちょうど前の週がある場合だけ出す（週が抜けていれば' + NA + '）。</div>';
   return h + '</section>';
 }
 function secVolume(c) {
@@ -1199,7 +1270,9 @@ function secVolume(c) {
   let h = '<section><h3>出来高（S高日=100）</h3><div class="vwrap"><canvas id="cVol"></canvas></div>';
   h += kv('下落日の平均出来高', ku(vs.down_avg) + '（' + vs.down_n + '日）');
   h += kv('反発日の平均出来高', ku(vs.up_avg) + '（' + vs.up_n + '日）');
-  h += '<div class="ref">S高日の翌日以降を前日比の符号で分けただけの実測値。'
+  h += '<div class="ref">棒は直近10営業日。S高日が10営業日より前なら<b>基準の100%バーは画面に出ない</b>'
+     + '（基準はS高日のまま）。下落日/反発日は S高日の翌日以降を前日比の符号で分けただけの実測値で、'
+     + '前日比ちょうど0の日はどちらにも数えない。'
      + '「枯れている＝買い」ではない。B群の検証を通すまで判断材料の一つとして見る。</div>';
   return h + '</section>';
 }
@@ -1212,9 +1285,11 @@ function secSector(c) {
           : s.hot + ' / ' + s.total + '銘柄');
   const eps = c.episodes || [];
   if (eps.length) {
-    h += '<table><thead><tr><th>過去のS高日</th><th>その後の最大押し</th><th>5営業日後</th></tr></thead><tbody>';
+    h += '<table><thead><tr><th>過去のS高日</th><th>最大押し</th><th>その日</th>'
+       + '<th>最大押しから5営業日後</th></tr></thead><tbody>';
     eps.forEach(function (e) {
       h += '<tr><td>' + esc(e.d) + '</td><td>' + nv(e.dd, 1, '%') + '</td><td>'
+         + (e.dd_date ? esc(e.dd_date) : '<span class="muted">' + NA + '</span>') + '</td><td>'
          + sv(e.r5, 1, '%') + '</td></tr>';
     });
     h += '</tbody></table>';
@@ -1222,17 +1297,23 @@ function secSector(c) {
     h += '<div class="body muted">過去2年に完了したS高エピソードなし</div>';
   }
   h += '<div class="ref"><b>参考のみ・予測に使わない。</b>同一銘柄の過去2年のS高について、'
-     + 'S高日から20営業日以内の終値最安値（対 期間最高値）と5営業日後の騰落を並べただけ。'
-     + '件数が少なく、地合いも違う。同業種の本数も母数が業種ごとに違う。</div>';
+     + 'S高日から20営業日以内で<b>その時点までの高値からの下押しが最も深かった値</b>と、'
+     + '<b>その日を起点にした</b>5営業日後の騰落を並べただけ。'
+     + '件数が少なく、地合いも違う。同業種の本数は自分自身を除いた母数。</div>';
   return h + '</section>';
 }
 // ---- P3: 判断ログ ----------------------------------------------------------
-function pnlHtml(o) {
+function pnlHtml(o, action) {
   if (!o) return '<span class="muted">' + NA + '</span>';
   if (o.status === 'pending') return '<span class="muted">経過待ち（あと' + o.left + '営業日）</span>';
   if (o.status !== 'done') return '<span class="muted">' + NA + '（' + esc(o.reason || '不明') + '）</span>';
-  const cls = o.pnl_pct >= 0 ? 'good' : 'warn';
+  if (o.entry === null || o.entry === undefined || o.exit === null || o.exit === undefined) {
+    return '<span class="muted">' + NA + '</span>';
+  }
+  // 見送りは「買っていたらこう動いた」なので、良し悪しの色は付けない
+  const cls = (action === 'skip') ? 'muted' : (o.pnl_pct >= 0 ? 'good' : 'warn');
   return '<b class="' + cls + '">' + sv(o.pnl_pct, 2, '%') + '</b>'
+       + (action === 'skip' ? '<span class="muted">(見送り後の値動き)</span>' : '')
        + ' <span class="muted">(' + esc(o.base_date) + ' ' + o.entry.toFixed(0)
        + ' → ' + esc(o.exit_date) + ' ' + o.exit.toFixed(0) + ')</span>';
 }
@@ -1240,7 +1321,7 @@ function decRows(list) {
   return list.map(function (d) {
     return '<tr><td>' + esc(d.date) + '</td><td>' + esc(d.code) + '</td><td>'
          + (d.action === 'buy' ? '買う' : d.action === 'skip' ? '見送り' : esc(d.action))
-         + '</td><td>' + esc(d.reason) + '</td><td>' + pnlHtml(d.outcome) + '</td></tr>';
+         + '</td><td>' + esc(d.reason) + '</td><td>' + pnlHtml(d.outcome, d.action) + '</td></tr>';
   }).join('');
 }
 function secDecision(code, disp) {
@@ -1250,7 +1331,8 @@ function secDecision(code, disp) {
      + '<label><input type="radio" name="dact" value="buy" checked> 買う</label> '
      + '<label><input type="radio" name="dact" value="skip"> 見送り</label></b></div>';
   h += '<div style="margin:6px 0"><input type="text" id="d-reason" placeholder="理由（例: 25MA到達＋枯れ比18%で反発）" style="width:100%"></div>';
-  h += '<div style="margin:6px 0"><label>建値 <input type="number" id="d-price" step="1" style="width:90px"></label> '
+  h += '<div style="margin:6px 0"><label>判断日 <input type="date" id="d-date" value="' + esc(TARGET) + '" style="width:130px"></label> '
+     + '<label>建値 <input type="number" id="d-price" step="1" style="width:90px"></label> '
      + '<button type="button" id="d-copy" data-code="' + esc(disp) + '">JSON行をコピー</button> '
      + '<span id="d-msg" class="muted"></span></div>';
   if (mine.length) {
@@ -1259,10 +1341,12 @@ function secDecision(code, disp) {
   } else {
     h += '<div class="body muted">この銘柄の記録はまだ無い</div>';
   }
-  h += '<div class="ref">コピーした1行を GitHub 上で <code>docs/data/decisions.json</code> の '
-     + '<code>decisions</code> 配列に貼って Commit する（Pages から直接は書き込めない）。'
+  h += '<div class="ref"><b>貼り方</b>: GitHub 上で <code>docs/data/decisions.json</code> を開き、'
+     + '<code>"decisions": [</code> の<b>直後</b>にコピーした1行を貼る（既に行があるなら、'
+     + '貼った行の<b>末尾にカンマ</b>を足す）。Pages から直接は書き込めないのでこの手順になる。'
      + '次回の実行で' + DECISION_HOLD + '営業日後の終値と突き合わせて損益が入る。'
-     + '建値を空にすると判断日の終値を建値とみなす。</div>';
+     + '判断日は既定でデータ基準日（' + esc(TARGET) + '）。建値を空にすると判断日の終値を建値とみなす。'
+     + '<b>JSONが壊れていると判断ログは丸ごと空になる</b>ので、貼ったあと画面に出るか確認すること。</div>';
   return h + '</section>';
 }
 function wireDecision() {
@@ -1271,11 +1355,14 @@ function wireDecision() {
   btn.onclick = function () {
     const act = document.querySelector('input[name="dact"]:checked');
     const price = document.getElementById('d-price').value.trim();
-    const row = {date: TARGET, code: btn.getAttribute('data-code'),
+    const dateEl = document.getElementById('d-date');
+    const row = {date: (dateEl && dateEl.value) ? dateEl.value : TARGET,
+                 code: btn.getAttribute('data-code'),
                  action: act ? act.value : 'buy',
                  reason: document.getElementById('d-reason').value.trim()};
     if (price !== '') row.price = parseFloat(price);
-    const text = JSON.stringify(row) + ',';
+    // 末尾カンマは付けない。配列の末尾に貼られると JSON が壊れ、判断ログが丸ごと消えるため
+    const text = JSON.stringify(row);
     const msg = document.getElementById('d-msg');
     const done = function (ok) { msg.textContent = ok ? 'コピーした: ' + text : text; };
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1381,13 +1468,15 @@ function fillSelect(id, values, allLabel) {
     });
   const dl = document.getElementById('declog');
   if (dl) {
-    dl.innerHTML = DECISIONS.length
+    const err = DECISION_ERROR
+      ? '<div class="warn" style="margin-bottom:6px">⚠ ' + esc(DECISION_ERROR) + '</div>' : '';
+    dl.innerHTML = err + (DECISIONS.length
       ? '<table><thead><tr><th>判断日</th><th>コード</th><th>判断</th><th>理由</th><th>'
         + DECISION_HOLD + '営業日後</th></tr></thead><tbody>'
         + decRows(DECISIONS.slice().reverse()) + '</tbody></table>'
       : '<div class="muted">まだ1件も記録が無い。'
         + '行をクリックしてカードの「判断ログ」から1行コピーし、'
-        + 'GitHub 上で docs/data/decisions.json に貼る。</div>';
+        + 'GitHub 上で docs/data/decisions.json に貼る。</div>');
   }
   const rs = document.getElementById('f-reset');
   if (rs) rs.onclick = function () {
@@ -1431,7 +1520,8 @@ def _row_payload(r: Dict[str, Any]) -> Dict[str, Any]:
 
 def render(target: str, records: List[Dict[str, Any]], crit: Optional[Dict[str, Any]] = None,
            docs: Optional[str] = None, dropped: int = 0,
-           decisions: Optional[List[Dict[str, Any]]] = None):
+           decisions: Optional[List[Dict[str, Any]]] = None,
+           dec_error: str = ""):
     crit = crit or DEFAULT_CRITERIA
     docs = docs or DOCS_DIR
     os.makedirs(os.path.join(docs, "data"), exist_ok=True)
@@ -1451,6 +1541,7 @@ def render(target: str, records: List[Dict[str, Any]], crit: Optional[Dict[str, 
 
     rows_js = _json_script([_row_payload(r) for r in records])
     dec_js = _json_script(decisions)
+    dec_err_js = _json_script(dec_error or "")
     chart_map = {r["raw_code"]: {"name": r["name"], "code": r["code"],
                                  "chart": r.get("chart", []),
                                  "card": r.get("card", {})} for r in records}
@@ -1579,6 +1670,7 @@ const MATERIAL_UNSET = "{MATERIAL_UNSET}";
 const NA = "{NA}";
 const DECISIONS = {dec_js};
 const DECISION_HOLD = {DECISION_HOLD};
+const DECISION_ERROR = {dec_err_js};
 let charts = [];
 function mk(id, cfg) {{
   const el = document.getElementById(id);
@@ -1704,7 +1796,8 @@ def main() -> int:
     series_by_code = {r["code"]: r.pop("_series") for r in records if "_series" in r}
     decisions = settle_decisions(jq, load_decisions(), series_by_code, target)
 
-    render(target, records, crit, dropped=len(failed), decisions=decisions)
+    render(target, records, crit, dropped=len(failed), decisions=decisions,
+           dec_error=DEC_ERR["msg"])
     print(f"[ok] APIリクエスト(論理) 合計 {REQ['n']} 回"
           f"（抽出まで {req_before_codes} / 銘柄別 {REQ['n'] - req_before_codes}）"
           f" / 所要 {time.time() - t0:.0f}秒")
