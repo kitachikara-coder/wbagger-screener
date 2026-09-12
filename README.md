@@ -1,30 +1,76 @@
 # wbagger-screener
 
-J-Quants API を使った日本株「初動スクリーニング」。GitHub Actions が毎朝（平日8:00 JST）自動実行し、結果を `docs/` に出力。GitHub Pages でブラウザ閲覧できる。
+J-Quants API を使った日本株「**ストップ高後の押し目**」スクリーニング。
+GitHub Actions が毎営業日（平日18:30 JST・当日終値の更新後）自動実行し、結果を `docs/` に出力。
+GitHub Pages でブラウザ閲覧できる。
+
+**買うべき銘柄を機械に決めさせない。** 直近20営業日にストップ高をつけた銘柄をぜんぶ並べ、
+「押し目がどこまで熟したか」を事実の列で見せる。合成スコアや◎○△の総合判定は作らない。
+最終判断は本人が行う。
+
+## 画面
+
+### 層A：ふるい一覧
+コード / 銘柄 / 市場 / **ストップ高日** / **高値からの日数** / **高値からの下落率** /
+**出来高枯れ比（当日・5日平均）** / **売買代金20日平均(億)** / 株価 / 前日比 / 時価総額 /
+**決算日まで(営業日)** / **材料分類** / タブー
+
+- 既定の並びは **ストップ高日が新しい順 → 出来高枯れ比が低い順**
+- フィルタ（市場・下落率レンジ・枯れ比・代金・材料分類・決算跨ぎ除外・検索）は
+  **既定ではどれも絞らない**。`backtest_dip.py` の検証が通るまで下落率・枯れ比で自動的に絞ることはしない
+- 列ヘッダをクリックすると並べ替わる
+
+### 層B：銘柄カード（行クリックで開く）
+チャートで見えない情報だけを置く。
+材料・材料分類・継続性（手入力）／決算日／信用買残3週と信用倍率／買残÷浮動株／
+S高日=100の出来高推移／下落日と反発日の平均出来高／位置要約1行／同業種の当日上昇本数／
+同一銘柄の過去2年のS高エピソード（参考のみ）。
+下にローソク足（日足/週足）・MA5/25/75・MACD・RCI9/26。
+
+### 判断ログ
+カードで「買う／見送り＋理由」を選んで **「JSON行をコピー」** し、GitHub 上で
+`docs/data/decisions.json` に貼って Commit する。次回の実行で **5営業日後の終値**と
+突き合わせて損益%が入る（未経過は「経過待ち」）。
 
 ## 仕組み
 1. Actions が `screener.py` を実行
-2. J-Quants 認証 → 東証グロースの前日データ取得
-3. 値上がり率 / 出来高急増 / S高 / 移動平均(パーフェクトオーダー) / MACD / 時価総額 / ファンダ / タブー / 信用残を計算
+2. 直近20営業日ぶんの日足を日付一括で取り、`UL=1`（制限値幅上限に到達）だった銘柄を集める
+3. 各銘柄の日足2年・財務・信用残を取り、押し目の熟成度とカードの中身を計算
 4. `docs/index.html` と `docs/data/latest.json` を生成しコミット
 5. GitHub Pages が公開
 
 ## セットアップ
-1. リポジトリ Secrets に登録（Settings → Secrets and variables → Actions）
-   - `JQUANTS_MAILADDRESS`
-   - `JQUANTS_PASSWORD`
-2. GitHub Pages を有効化（Settings → Pages → Source: `main` / フォルダ `/docs`）
-3. Actions タブ → `screen` → **Run workflow** で手動実行（初回テスト）
-4. 公開URL（例）: `https://<ユーザー名>.github.io/wbagger-screener/`
+1. J-Quants ダッシュボードで **API キー** を発行（v2はAPIキー方式）
+2. リポジトリ Secrets に登録（Settings → Secrets and variables → Actions）: `JQUANTS_API_KEY`
+3. GitHub Pages を有効化（Settings → Pages → Source: `main` / フォルダ `/docs`）
+4. Actions タブ → `screen` → **Run workflow** で手動実行（初回テスト）
+5. 公開URL（例）: `https://<ユーザー名>.github.io/wbagger-screener/`
+
+## 手入力
+`manual/{4桁コード}.yaml`（`manual/_template.yaml` をコピーして使う）。
+材料・材料分類・継続性・決算日・浮動株数。**未入力でも画面は壊れない**（「未」「—」で出る）。
 
 ## 閾値の調整
-`criteria.yaml` を編集（時価総額レンジ・出来高倍率・利益率など）。
+`criteria.yaml` を編集。`sh_window`（S高を探す営業日数）、`earnings_skip_bdays`、
+`dip_default_filter` / `dip_dd_band` / `dip_dry_max`（B群ゲート）ほか。
+
+## テスト
+```
+python3 -m pytest tests/ -q      # ネット不要（APIは全部モック）
+```
 
 ## 制約
-- 無料プランは12週遅延のため Light 以上が必要（前営業日データ）
-- 材料・テーマ・開示の中身は J-Quants 非配信 → TDnet/EDINET で別途確認
+- J-Quants **v2**（APIキー方式・base `https://api.jquants.com/v2`）／**Standard プラン**が必要
+  （信用残 `/markets/margin-interest` は Standard 以上）
+- `UL=1` は「日通し高値が制限値幅上限に**達した**」の意味で、**ストップ高で引けたとは限らない**
+- `/equities/earnings-calendar` は**翌営業日発表分しか返さない限定フィード**。
+  決算日は `manual/{code}.yaml` の手入力が主
+- 日証金の貸借倍率・浮動株比率は J-Quants 非配信。信用倍率（買残÷売残）で代替し、
+  浮動株は手入力した銘柄だけ表示
+- 営業日数の計算は**土日のみ考慮・祝日未対応**（多めに出る）
+- 材料・テーマ・開示の中身は非配信 → TDnet/EDINET で別途確認
 - EOD（日次）ベース。ザラ場の板・歩み値は対象外
-- フィールド名は J-Quants 公式リファレンスで要確認（仕様変更時は `screener.py` を調整）
+- 1回の実行で **論理APIリクエスト 約290回・約6分**（母集団90銘柄のとき。2026-09-11 実測）
 
 ## 免責
 本ツールの抽出は機械的処理であり投資助言ではない。最終判断は自己責任。
