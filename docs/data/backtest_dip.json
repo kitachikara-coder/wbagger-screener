@@ -1,0 +1,96 @@
+{
+  "generated_at": "2026-09-12T21:39:11+09:00",
+  "period": "2024-08-13〜2026-09-12",
+  "markets": [
+    "グロース",
+    "スタンダード"
+  ],
+  "codes": 2158,
+  "fetched": 2156,
+  "params": {
+    "sh_window": 20,
+    "hold": 5,
+    "tp": 0.05,
+    "sl": -0.07,
+    "cost": 0.0025,
+    "dd_band": [
+      -0.2,
+      -0.1
+    ],
+    "dry_max": 0.3
+  },
+  "buckets": {
+    "bench_all": {
+      "n": 1014604,
+      "tp_rate": 21.2,
+      "sl_rate": 10.0,
+      "avg_pnl": -0.13,
+      "win_rate": 48.1
+    },
+    "post_sh_all": {
+      "n": 53164,
+      "tp_rate": 39.8,
+      "sl_rate": 27.4,
+      "avg_pnl": -0.5,
+      "win_rate": 50.0
+    },
+    "signal_all": {
+      "n": 10854,
+      "tp_rate": 35.7,
+      "sl_rate": 20.6,
+      "avg_pnl": -0.28,
+      "win_rate": 50.3
+    },
+    "signal_first": {
+      "n": 1601,
+      "tp_rate": 42.8,
+      "sl_rate": 30.2,
+      "avg_pnl": -0.59,
+      "win_rate": 50.3
+    }
+  },
+  "grid": {
+    "主条件 DD-20〜-10 / 枯れ≤30%": {
+      "n": 10854,
+      "tp_rate": 35.7,
+      "sl_rate": 20.6,
+      "avg_pnl": -0.28,
+      "win_rate": 50.3
+    },
+    "枯れ≤50%": {
+      "n": 12485,
+      "tp_rate": 37.2,
+      "sl_rate": 22.2,
+      "avg_pnl": -0.3,
+      "win_rate": 50.5
+    },
+    "枯れ条件なし": {
+      "n": 16797,
+      "tp_rate": 38.8,
+      "sl_rate": 26.0,
+      "avg_pnl": -0.47,
+      "win_rate": 50.0
+    },
+    "DD-30〜-10 / 枯れ≤30%": {
+      "n": 19329,
+      "tp_rate": 37.3,
+      "sl_rate": 21.9,
+      "avg_pnl": -0.3,
+      "win_rate": 50.2
+    },
+    "DD-15〜-5 / 枯れ≤30%": {
+      "n": 9988,
+      "tp_rate": 33.6,
+      "sl_rate": 20.1,
+      "avg_pnl": -0.35,
+      "win_rate": 49.6
+    },
+    "DD-25〜-15 / 枯れ≤30%": {
+      "n": 10057,
+      "tp_rate": 37.7,
+      "sl_rate": 22.4,
+      "avg_pnl": -0.31,
+      "win_rate": 50.0
+    }
+  }
+}

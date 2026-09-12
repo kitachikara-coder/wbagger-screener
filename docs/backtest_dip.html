@@ -1,0 +1,28 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>S高後の押し目 ブラケット検証</title>
+<style>
+body{font-family:system-ui,'Hiragino Sans',sans-serif;margin:16px;background:#0d1117;color:#e6edf3}
+h1{font-size:18px} h2{font-size:15px;margin-top:22px} .meta{color:#8b949e;font-size:13px;margin-bottom:12px}
+table{border-collapse:collapse;width:100%;font-size:13px;max-width:860px}
+th,td{border:1px solid #30363d;padding:7px 9px;text-align:left}
+th{background:#161b22} td.num{text-align:right} tr.hl{background:#13301f}
+.verdict{margin:14px 0;padding:10px 12px;border:1px solid #30363d;border-radius:8px;background:#161b22}
+.note{color:#8b949e;font-size:12px;margin-top:14px;line-height:1.7} a{color:#58a6ff}
+</style></head><body>
+<h1>ストップ高後の押し目 — 先着ブラケット検証（+5%／-7%・5営業日）</h1>
+<div class="meta">期間: 2024-08-13〜2026-09-12 ／ 東証グロース＋スタンダード 2156銘柄 ／ 生成: 2026-09-12 21:39 JST<br>
+シグナル: 直近20営業日内にS高 → 最高値から下落率 -20〜-10% かつ 出来高枯れ比 ≤30% ／ 翌営業日始値エントリー ／ 往復コスト0.25%</div>
+<div class="verdict">判定：<b>不合格</b>：いずれかが無選別以下 → 層Aの抽出条件を見直してから実装（感度表を参照）</div>
+<h2>主結果</h2>
+<table><thead><tr><th>条件</th><th>+5%到達率</th><th>平均損益</th><th>勝率</th><th>-7%到達率</th><th>n</th></tr></thead>
+<tbody><tr class=""><td>① 無選別（全銘柄全日）</td><td class="num">21.2%</td><td class="num">-0.13%</td><td class="num">48.1%</td><td class="num">10.0%</td><td class="num">1,014,604</td></tr><tr class=""><td>② S高後1〜20日の全日（条件なし）</td><td class="num">39.8%</td><td class="num">-0.5%</td><td class="num">50.0%</td><td class="num">27.4%</td><td class="num">53,164</td></tr><tr class="hl"><td>★ 主条件（DD-20〜-10・枯れ≤30%）全日</td><td class="num">35.7%</td><td class="num">-0.28%</td><td class="num">50.3%</td><td class="num">20.6%</td><td class="num">10,854</td></tr><tr class="hl"><td>★ 主条件・エピソード初回のみ</td><td class="num">42.8%</td><td class="num">-0.59%</td><td class="num">50.3%</td><td class="num">30.2%</td><td class="num">1,601</td></tr></tbody></table>
+<h2>感度（主条件を±1段）</h2>
+<table><thead><tr><th>条件</th><th>+5%到達率</th><th>平均損益</th><th>勝率</th><th>-7%到達率</th><th>n</th></tr></thead>
+<tbody><tr class="hl"><td>主条件 DD-20〜-10 / 枯れ≤30%</td><td class="num">35.7%</td><td class="num">-0.28%</td><td class="num">50.3%</td><td class="num">20.6%</td><td class="num">10,854</td></tr><tr class=""><td>枯れ≤50%</td><td class="num">37.2%</td><td class="num">-0.3%</td><td class="num">50.5%</td><td class="num">22.2%</td><td class="num">12,485</td></tr><tr class=""><td>枯れ条件なし</td><td class="num">38.8%</td><td class="num">-0.47%</td><td class="num">50.0%</td><td class="num">26.0%</td><td class="num">16,797</td></tr><tr class=""><td>DD-30〜-10 / 枯れ≤30%</td><td class="num">37.3%</td><td class="num">-0.3%</td><td class="num">50.2%</td><td class="num">21.9%</td><td class="num">19,329</td></tr><tr class=""><td>DD-15〜-5 / 枯れ≤30%</td><td class="num">33.6%</td><td class="num">-0.35%</td><td class="num">49.6%</td><td class="num">20.1%</td><td class="num">9,988</td></tr><tr class=""><td>DD-25〜-15 / 枯れ≤30%</td><td class="num">37.7%</td><td class="num">-0.31%</td><td class="num">50.0%</td><td class="num">22.4%</td><td class="num">10,057</td></tr></tbody></table>
+<div class="note">
+<b>読み方</b>：★がベンチ①（無選別）と②（S高後の全日）を<b>両方</b>上回って初めて、押し目条件（下落率・枯れ比）に選別力があると言える。②だけ上回るなら「S高後であること」自体の効果。<br>
+感度表で主条件だけ良く前後のセルが悪ければ偶然の疑い（ナイフエッジ）。中庸の値を採る。<br>
+<b>限界</b>：上場廃止除外（生存者バイアス・楽観方向）／日足近似で両触れは損切り優先（保守）／スリッページ未考慮／連続シグナル日は相関（初回のみ行を併記）。<br>
+本結果は機械的検証であり投資助言ではない。最終判断は自己責任。｜ <a href="./">スクリーニングへ</a> ｜ <a href="./backtest.html">S高×フィルタ検証へ</a>
+</div></body></html>
