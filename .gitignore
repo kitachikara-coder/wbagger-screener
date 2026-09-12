@@ -1,0 +1,5 @@
+# macOS / Python のローカル生成物
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
