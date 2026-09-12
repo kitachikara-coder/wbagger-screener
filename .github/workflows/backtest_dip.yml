@@ -1,0 +1,39 @@
+name: backtest_dip
+
+on:
+  workflow_dispatch: {}   # 手動実行のみ
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # グロース＋スタンダード約2,100銘柄 × 約1秒 ≒ 40分
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run dip backtest
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          BT_MAX_CODES: "0"   # 試走なら "100"
+        run: python backtest_dip.py
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "backtest_dip update ($(TZ=Asia/Tokyo date +%Y-%m-%d))"
+            git push
+          fi
