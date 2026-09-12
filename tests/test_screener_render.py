@@ -76,7 +76,7 @@ class FakeJQ:
         return []
 
 
-def build_records(manual_dir=None, sectors=None, ecal=None):
+def build_records(manual_dir=None, sectors=None, ecal=None, chg_all=None):
     # コードは実データと同じ5桁（表示は disp_code で4桁になる）。
     # 13010→"1301" / 338A0→"338A" / 99970→"9997"
     bars = {"13010": synth_bars("13010", sh_offset=8),     # 押し目進行中
@@ -95,7 +95,8 @@ def build_records(manual_dir=None, sectors=None, ecal=None):
                 "sh_date": sh_date, "sh_vol": None, "sh_close": None,
                 "date_target": TARGET}
         recs.append(sc.analyze_candidate(jq, item, names, mkt, dict(sc.DEFAULT_CRITERIA),
-                                         sec, ecal or {}, manual_dir))
+                                         sec=sec, ecal=ecal or {}, chg_all=chg_all or {},
+                                         manual_dir=manual_dir))
     return recs, jq
 
 
@@ -175,7 +176,8 @@ def test_row_codes_match_chart_keys():
     data = json.loads(html[html.index("const DATA = ") + len("const DATA = "):
                            html.index(";\nconst ROWS")])
     assert {r["rc"] for r in rows} == set(data)
-    assert "showChart(\\'' + r.rc + '\\')" in html
+    assert "openRow(\\'' + r.rc + '\\')" in html
+    assert "function openRow(code) { showChart(code); renderCard(code); }" in html
 
 
 def test_default_sort_is_shdate_desc_then_dry_asc():

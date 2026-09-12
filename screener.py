@@ -474,6 +474,171 @@ def days_to_earnings(edate: Any, today: dt.date) -> Optional[int]:
     return bdays_between(today, d)
 
 
+# ----------------------------------------------------------------------
+# 層B（銘柄カード）— チャートで見えない情報
+# ----------------------------------------------------------------------
+def parse_margin(rows: List[Dict[str, Any]], weeks: int = 3) -> List[Dict[str, Any]]:
+    """信用取引週末残高(週次)の直近 weeks 週。Date は金曜。
+
+    信用倍率 = LongVol ÷ ShrtVol。**日証金の貸借倍率とは別物**（あちらは非配信）。
+    ShrtVol が 0 / 欠損の週は倍率だけ None にして、週そのものは残す
+    （「売残ゼロ」は消してよい情報ではないため）。
+    同一 Date に IssType 違いの行が来た場合は最後の1行を採る。
+    """
+    by_date: Dict[str, Dict[str, Any]] = {}
+    for r in rows or []:
+        d = str(r.get("Date") or "").strip()
+        if d:
+            by_date[d] = r
+    out: List[Dict[str, Any]] = []
+    for d in sorted(by_date)[-max(1, weeks):]:
+        r = by_date[d]
+        lv, sv = fnum(r.get("LongVol")), fnum(r.get("ShrtVol"))
+        neg = fnum(r.get("LongNegVol"))
+        out.append({"date": d, "long": lv, "short": sv,
+                    "ratio": (lv / sv) if (lv is not None and sv) else None,
+                    "std_ratio": ((fnum(r.get("LongStdVol")) / fnum(r.get("ShrtStdVol")))
+                                  if (fnum(r.get("LongStdVol")) is not None
+                                      and fnum(r.get("ShrtStdVol"))) else None),
+                    "neg_pct": (neg / lv * 100) if (neg is not None and lv) else None,
+                    "d_long": None, "d_ratio": None})
+    for i in range(1, len(out)):
+        p, c = out[i - 1], out[i]
+        if c["long"] is not None and p["long"] is not None:
+            c["d_long"] = c["long"] - p["long"]
+        if c["ratio"] is not None and p["ratio"] is not None:
+            c["d_ratio"] = c["ratio"] - p["ratio"]
+    return out
+
+
+def fetch_margin(jq: JQuants, code: str, target: Optional[str] = None,
+                 weeks: int = 3) -> Tuple[List[Dict[str, Any]], str]:
+    """(直近weeks週, 取得できなかった理由) を返す。取得できたら理由は空文字。
+
+    403/401 は「プラン外」、それ以外の HTTP エラーと通信断は「取得失敗」、
+    200 でも中身が空なら「データ無し」と、**理由を区別して**返す
+    （画面で「—」の意味が分かるようにするため）。
+    """
+    params: Dict[str, Any] = {"code": code}
+    if target:
+        frm = (dt.datetime.strptime(target, "%Y-%m-%d").date()
+               - dt.timedelta(days=30 * (weeks + 2))).strftime("%Y-%m-%d")
+        params.update({"from": frm, "to": target})
+    try:
+        rows = api(jq, "/markets/margin-interest", params)
+    except requests.HTTPError as e:
+        st = getattr(getattr(e, "response", None), "status_code", None)
+        if st in (401, 403):
+            return [], "プラン外（Standard以上が必要）"
+        return [], f"取得失敗(HTTP {st})"
+    except Exception as e:
+        return [], f"取得失敗({type(e).__name__})"
+    if not rows:
+        return [], "データ無し"
+    parsed = parse_margin(rows, weeks)
+    return (parsed, "" if parsed else "データ無し")
+
+
+def volume_profile(dates: List[str], vols: List[Optional[float]],
+                   sh_idx: Optional[int], n: int = 10) -> List[Dict[str, Any]]:
+    """S高日=100 とした直近 n 営業日の出来高。S高日が窓の外でも基準は S高日のまま。"""
+    if sh_idx is None or not dates:
+        return []
+    base = vols[sh_idx] if sh_idx < len(vols) else None
+    out = []
+    for i in range(max(0, len(dates) - n), len(dates)):
+        v = vols[i] if i < len(vols) else None
+        out.append({"d": dates[i][5:].replace("-", "/"),
+                    "pct": (v / base * 100) if (base and v is not None) else None,
+                    "sh": i == sh_idx})
+    return out
+
+
+def dip_volume_split(closes: List[Optional[float]], vols: List[Optional[float]],
+                     sh_idx: Optional[int]) -> Dict[str, Any]:
+    """S高日の翌日以降を、前日比マイナスの日とプラスの日に分けた平均出来高。
+
+    「下げる日ほど商いが細っているか」を数字で見るための素材。解釈は載せない。
+    """
+    out = {"down_avg": None, "up_avg": None, "down_n": 0, "up_n": 0}
+    if sh_idx is None:
+        return out
+    down, up = [], []
+    for i in range(max(1, sh_idx + 1), min(len(closes), len(vols))):
+        c, p, v = closes[i], closes[i - 1], vols[i]
+        if c is None or p is None or v is None:
+            continue
+        (up if c >= p else down).append(v)
+    if down:
+        out["down_avg"], out["down_n"] = sum(down) / len(down), len(down)
+    if up:
+        out["up_avg"], out["up_n"] = sum(up) / len(up), len(up)
+    return out
+
+
+def position_summary(closes: List[Optional[float]], dd_pct: Optional[float]) -> str:
+    """「5MA下・25MA上・75MA上・高値-14.2%」の1行。チャートで見える内容の要約なので短く。"""
+    vals = [c for c in closes if c is not None]
+    if not vals:
+        return NA
+    price, parts = vals[-1], []
+    for n in (5, 25, 75):
+        m = sma(vals, n)
+        parts.append(f"{n}MA{'上' if price > m else '下'}" if m is not None else f"{n}MA{NA}")
+    parts.append(f"高値{dd_pct:+.1f}%" if dd_pct is not None else f"高値{NA}")
+    return "・".join(parts)
+
+
+def sector_comove(code: str, sec: Dict[str, str], chg_all: Dict[str, float],
+                  thr: float = 3.0) -> Dict[str, Any]:
+    """同一33業種のうち、当日 前日比 ≥ thr% だった銘柄数（母数つき）。追加API 0。
+
+    母数は全市場（グロース＋スタンダードに限らない）。業種の広がりを見るため。
+    """
+    name = sec.get(code, "")
+    out = {"name": name, "hot": None, "total": None, "thr": thr}
+    if not name:
+        return out
+    peers = [c for c, s in sec.items() if s == name and c in chg_all]
+    if not peers:
+        return out
+    out["total"] = len(peers)
+    out["hot"] = sum(1 for c in peers if chg_all[c] >= thr)
+    return out
+
+
+def past_sh_episodes(dates: List[str], highs: List[Optional[float]],
+                     closes: List[Optional[float]], uls: List[bool],
+                     gap: int = 20, fwd: int = 5, limit: int = 6) -> List[Dict[str, Any]]:
+    """同一銘柄の過去のS高エピソード（S高日 → 最大押し → その後5営業日の騰落）。
+
+    **参考表示のみ。予測には使わない。** 直近 gap 本に入るエピソード（＝今回の分）は
+    まだ結果が出ていないので除く。連続したS高は gap 本以内なら1エピソードにまとめる。
+    """
+    n = len(dates)
+    eps: List[Dict[str, Any]] = []
+    last = None
+    for i in range(n):
+        if not uls[i]:
+            continue
+        if last is not None and i - last < gap:
+            last = i
+            continue
+        last = i
+        if i >= n - gap:                 # 進行中のエピソードは結果が確定していない
+            continue
+        hs = [h for h in highs[i:i + gap + 1] if h is not None]
+        cs = [c for c in closes[i:i + gap + 1] if c is not None]
+        peak = max(hs) if hs else None
+        trough = min(cs) if cs else None
+        c0 = closes[i]
+        cf = closes[i + fwd] if i + fwd < n else None
+        eps.append({"d": dates[i],
+                    "dd": ((trough / peak - 1) * 100) if (peak and trough) else None,
+                    "r5": ((cf / c0 - 1) * 100) if (c0 and cf) else None})
+    return eps[-limit:]
+
+
 def build_shortlist(jq: JQuants, target: str, prev: str, uni_codes: set,
                     sh_map: Dict[str, Dict[str, Any]], crit: Dict[str, Any],
                     cache=None) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -570,6 +735,7 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
                       mkt: Dict[str, str], crit: Dict[str, Any],
                       sec: Optional[Dict[str, str]] = None,
                       ecal: Optional[Dict[str, str]] = None,
+                      chg_all: Optional[Dict[str, float]] = None,
                       manual_dir: Optional[str] = None) -> Dict[str, Any]:
     code = item["code"]
     today = dt.datetime.strptime(item["date_target"], "%Y-%m-%d").date()
@@ -591,7 +757,7 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         "op_margin": None, "equity_ratio": None, "roe": None,
         "profit_trend": None, "taboo_hit": None, "taboo_reason": "",
         "margin_long_k": None, "stop_loss": None, "manual_note": "",
-        "note_data": "", "chart": [],
+        "note_data": "", "chart": [], "card": {},
     }
 
     manual = load_manual(code, manual_dir)
@@ -622,6 +788,7 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
     uls = [str(h.get("UL")) == "1" for h in hist]
 
     # 押し目の熟成度。調整済み系列から一貫して算出する（S高日の出来高も同系列から採る）
+    dm = {"sh_idx": None}
     if item.get("sh_date"):
         dm = dip_metrics(dates, highs, closes, vols, item["sh_date"])
         for k in ("days_from_peak", "dd_pct", "dry_pct", "dry5_pct", "peak", "peak_date"):
@@ -689,20 +856,47 @@ def analyze_candidate(jq: JQuants, item: Dict[str, Any], names: Dict[str, str],
         rec["taboo_hit"] = len(reasons) > 0
         rec["taboo_reason"] = " / ".join(reasons)
 
-    try:
-        mgn = api(jq, "/markets/margin-interest", {"code": code})
-        if mgn:
-            mgn.sort(key=lambda m: m.get("Date", ""))
-            last = mgn[-1]
-            for key in ("LongMarginTradeVolume", "LongVo", "Long", "LongMargin", "LMgn"):
-                if key in last:
-                    lv = fnum(last.get(key))
-                    if lv is not None:
-                        rec["margin_long_k"] = round(lv / 1000, 1)
-                    break
-    except Exception:
-        pass
+    # 信用取引週末残高（G2 修正: v2 の実名は LongVol / ShrtVol）
+    mweeks, mreason = fetch_margin(jq, code, item["date_target"])
+    if mweeks and mweeks[-1]["long"] is not None:
+        rec["margin_long_k"] = round(mweeks[-1]["long"] / 1000, 1)
 
+    # 買残÷浮動株（浮動株はJ-Quants非配信。手入力がある銘柄だけ）
+    float_pct = None
+    try:
+        fs = manual.get("float_shares")
+        fs = float(fs) if fs not in (None, "") else None
+    except (TypeError, ValueError):
+        fs = None
+    if fs and fs > 0 and mweeks and mweeks[-1]["long"] is not None:
+        float_pct = mweeks[-1]["long"] / fs * 100
+
+    sh_idx = dm["sh_idx"] if item.get("sh_date") else None
+    rec["card"] = {
+        "material": str(manual.get("material") or "").strip(),
+        "material_class": rec["material_class"],
+        "continuity": str(manual.get("continuity") or "").strip(),
+        "note": str(manual.get("note") or "").strip(),
+        "earn": {"date": rec["earn_date"], "src": rec["earn_src"], "bdays": rec["earn_bdays"]},
+        "margin": {"weeks": [{k: (r2(v, 3) if isinstance(v, float) else v)
+                              for k, v in w.items()} for w in mweeks],
+                   "reason": mreason, "float_pct": r2(float_pct, 1)},
+        "vol_profile": [{"d": p["d"], "pct": r2(p["pct"], 1), "sh": p["sh"]}
+                        for p in volume_profile(dates, vols, sh_idx)],
+        "vol_split": {k: (r2(v, 0) if isinstance(v, float) else v)
+                      for k, v in dip_volume_split(closes, vols, sh_idx).items()},
+        "pos": position_summary(closes, rec["dd_pct"]),
+        "sector": sector_comove(code, sec or {}, chg_all or {}),
+        "episodes": [{"d": e["d"], "dd": r2(e["dd"], 1), "r5": r2(e["r5"], 1)}
+                     for e in past_sh_episodes(dates, highs, closes, uls)],
+        "funda": {"eqar": rec["equity_ratio"], "opm": rec["op_margin"], "roe": rec["roe"],
+                  "trend": rec["profit_trend"], "cap": rec["market_cap_oku"],
+                  "volx": rec["volume_x"], "po": rec["ma_perfect_order"],
+                  "macd": rec["macd_cross"], "stop_loss": rec["stop_loss"],
+                  "turnover": rec["turnover_oku"]},
+        "taboo": rec["taboo_reason"], "taboo_hit": rec["taboo_hit"],
+        "sh_date": rec["sh_date"], "sh_vol": rec["sh_vol"],
+    }
     return rec
 
 
@@ -751,7 +945,7 @@ function cellHtml(col, r) {
   if (col.k === 'tb') {
     if (r.tbh === null || r.tbh === undefined) return '<td class="na">' + NA + '</td>';
     if (!r.tbh) return '<td></td>';
-    return '<td class="warn">' + v + '</td>';
+    return '<td class="warn">' + esc(v) + '</td>';
   }
   if (na) { txt = (col.k === 'mcl') ? MATERIAL_UNSET : NA; cls += ' na'; }
   else if (col.k === 'p')   txt = '¥' + fmt(v, '', 1);
@@ -768,7 +962,7 @@ function cellHtml(col, r) {
     if (v <= 5) cls += ' earn-near';
   }
   else if (col.k === 'tb')  { txt = v; cls += ' warn'; }
-  else txt = String(v);
+  else txt = esc(v);
   return '<td class="' + cls.trim() + '">' + txt + '</td>';
 }
 function cmp(a, b) {
@@ -788,6 +982,136 @@ function cmp(a, b) {
   }
   return d * sortDir;
 }
+// ---- 層B: 銘柄カード（チャートで見えない情報だけ） --------------------------
+let vchart = null;
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function nv(v, nd, suf) {
+  if (v === null || v === undefined || v === '') return '<span class="muted">' + NA + '</span>';
+  return (typeof v === 'number' ? v.toFixed(nd === undefined ? 1 : nd) : esc(v)) + (suf || '');
+}
+function sv(v, nd, suf) {   // 符号つき
+  if (v === null || v === undefined) return '<span class="muted">' + NA + '</span>';
+  return (v >= 0 ? '+' : '') + v.toFixed(nd === undefined ? 1 : nd) + (suf || '');
+}
+function kv(k, v, cls) { return '<div class="kv"><span>' + k + '</span><b class="' + (cls || '') + '">' + v + '</b></div>'; }
+function ku(n) {   // 株数を千株単位で
+  if (n === null || n === undefined) return '<span class="muted">' + NA + '</span>';
+  return (n / 1000).toFixed(0) + '千株';
+}
+function secMaterial(c) {
+  let h = '<section><h3>材料（手入力）</h3>';
+  h += kv('分類', c.material_class && c.material_class !== MATERIAL_UNSET
+          ? esc(c.material_class) : '<span class="muted">' + MATERIAL_UNSET + '</span>');
+  h += c.material ? '<div class="body">' + esc(c.material) + '</div>'
+                  : '<div class="body muted">未入力（manual/&lt;code&gt;.yaml に material を書く）</div>';
+  if (c.continuity) h += '<div class="body">継続性: ' + esc(c.continuity) + '</div>';
+  if (c.note) h += '<div class="body muted">' + esc(c.note) + '</div>';
+  h += '<div class="ref">材料の中身はJ-Quants非配信。TDnet/EDINET で確認して手入力する。</div>';
+  return h + '</section>';
+}
+function secPosition(c) {
+  const f = c.funda || {};
+  let h = '<section><h3>位置とファンダ（一覧から移動）</h3>';
+  h += kv('位置', esc(c.pos));
+  h += kv('決算日', c.earn && c.earn.date
+          ? esc(c.earn.date) + '（' + esc(c.earn.src) + '）あと ' + nv(c.earn.bdays, 0, '営業日')
+          : '<span class="muted">' + NA + '</span>');
+  h += kv('自己資本比率', nv(f.eqar, 1, '%'), (f.eqar !== null && f.eqar <= 30) ? 'warn' : '');
+  h += kv('営業利益率', f.opm === null || f.opm === undefined
+          ? '<span class="muted">' + NA + '</span>' : (f.opm * 100).toFixed(1) + '%');
+  h += kv('ROE', nv(f.roe, 1, '%'));
+  h += kv('増益', nv(f.trend, 0));
+  h += kv('時価総額', nv(f.cap, 1, '億'));
+  h += kv('出来高倍(20日平均比)', nv(f.volx, 1, '倍'));
+  h += kv('P.O. / MACD', (f.po === true ? '○' : f.po === false ? '×' : NA) + ' / '
+          + (f.macd === true ? '○' : f.macd === false ? '×' : NA));
+  h += kv('逆指値目安(直近5日安値)', nv(f.stop_loss, 0));
+  if (c.taboo_hit) h += kv('タブー', esc(c.taboo), 'warn');
+  return h + '</section>';
+}
+function secMargin(c) {
+  const m = c.margin || {}, ws = m.weeks || [];
+  let h = '<section><h3>信用残（週次・金曜時点）</h3>';
+  if (!ws.length) {
+    h += '<div class="body muted">' + NA + '（' + esc(m.reason || '取得不可') + '）</div>';
+  } else {
+    h += '<table><thead><tr><th>週</th><th>買残</th><th>売残</th><th>倍率</th><th>買残前週比</th></tr></thead><tbody>';
+    ws.forEach(function (w) {
+      h += '<tr><td>' + esc(w.date) + '</td><td>' + ku(w.long) + '</td><td>' + ku(w.short)
+         + '</td><td>' + nv(w.ratio, 2, '倍') + '</td><td>'
+         + (w.d_long === null || w.d_long === undefined ? '<span class="muted">' + NA + '</span>'
+            : (w.d_long >= 0 ? '↑' : '↓') + ku(Math.abs(w.d_long))) + '</td></tr>';
+    });
+    h += '</tbody></table>';
+    const last = ws[ws.length - 1];
+    h += kv('信用倍率 前週比', sv(last.d_ratio, 2, '倍'));
+    if (m.float_pct !== null && m.float_pct !== undefined) {
+      h += kv('買残÷浮動株', m.float_pct.toFixed(1) + '%',
+              m.float_pct >= 25 ? 'warn' : m.float_pct >= 10 ? 'warn' : '');
+    }
+  }
+  h += '<div class="ref">信用倍率＝買残÷売残。<b>日証金の貸借倍率とは別物</b>（日証金分はJ-Quants非配信）。'
+     + '買残÷浮動株は浮動株を手入力した銘柄だけ（10%超で警告色）。'
+     + '週次データは基準日の翌週に公表されるので、当日の需給ではない。</div>';
+  return h + '</section>';
+}
+function secVolume(c) {
+  const vs = c.vol_split || {};
+  let h = '<section><h3>出来高（S高日=100）</h3><div class="vwrap"><canvas id="cVol"></canvas></div>';
+  h += kv('下落日の平均出来高', ku(vs.down_avg) + '（' + vs.down_n + '日）');
+  h += kv('反発日の平均出来高', ku(vs.up_avg) + '（' + vs.up_n + '日）');
+  h += '<div class="ref">S高日の翌日以降を前日比の符号で分けただけの実測値。'
+     + '「枯れている＝買い」ではない。B群の検証を通すまで判断材料の一つとして見る。</div>';
+  return h + '</section>';
+}
+function secSector(c) {
+  const s = c.sector || {};
+  let h = '<section><h3>セクター連動・過去の類似局面</h3>';
+  h += kv('33業種', s.name ? esc(s.name) : '<span class="muted">' + NA + '</span>');
+  h += kv('同業種で当日 +' + (s.thr || 3) + '%以上',
+          (s.hot === null || s.hot === undefined) ? '<span class="muted">' + NA + '</span>'
+          : s.hot + ' / ' + s.total + '銘柄');
+  const eps = c.episodes || [];
+  if (eps.length) {
+    h += '<table><thead><tr><th>過去のS高日</th><th>その後の最大押し</th><th>5営業日後</th></tr></thead><tbody>';
+    eps.forEach(function (e) {
+      h += '<tr><td>' + esc(e.d) + '</td><td>' + nv(e.dd, 1, '%') + '</td><td>'
+         + sv(e.r5, 1, '%') + '</td></tr>';
+    });
+    h += '</tbody></table>';
+  } else {
+    h += '<div class="body muted">過去2年に完了したS高エピソードなし</div>';
+  }
+  h += '<div class="ref"><b>参考のみ・予測に使わない。</b>同一銘柄の過去2年のS高について、'
+     + 'S高日から20営業日以内の終値最安値（対 期間最高値）と5営業日後の騰落を並べただけ。'
+     + '件数が少なく、地合いも違う。同業種の本数も母数が業種ごとに違う。</div>';
+  return h + '</section>';
+}
+function renderCard(code) {
+  const el = document.getElementById('card');
+  if (!el) return;
+  if (vchart) { vchart.destroy(); vchart = null; }
+  const d = DATA[code], c = d && d.card;
+  if (!c || !Object.keys(c).length) { el.innerHTML = ''; return; }
+  el.innerHTML = secMaterial(c) + secPosition(c) + secMargin(c) + secVolume(c) + secSector(c);
+  const vp = c.vol_profile || [];
+  const cv = document.getElementById('cVol');
+  if (cv && vp.length) {
+    vchart = new Chart(cv, {type: 'bar', data: {labels: vp.map(function (p) { return p.d; }),
+      datasets: [{label: 'S高日=100', data: vp.map(function (p) { return p.pct; }),
+        backgroundColor: vp.map(function (p) { return p.sh ? '#f0a020' : '#39506b'; })}]},
+      options: {responsive: true, maintainAspectRatio: false,
+        plugins: {legend: {display: false}},
+        scales: {x: {grid: {color: '#222'}, ticks: {color: '#8b949e', font: {size: 9}, maxTicksLimit: 10}},
+                 y: {grid: {color: '#222'}, ticks: {color: '#8b949e', font: {size: 9}}}}}});
+  }
+}
+function openRow(code) { showChart(code); renderCard(code); }
+
 function val(id) { const e = document.getElementById(id); return e ? e.value.trim() : ''; }
 function num(id) { const v = val(id); return v === '' ? null : parseFloat(v); }
 function passes(r) {
@@ -832,7 +1156,7 @@ function draw() {
   const rows = userSorted ? ROWS.filter(passes).sort(cmp) : ROWS.filter(passes);
   document.getElementById('tbody').innerHTML = rows.length
     ? rows.map(function (r) {
-        return '<tr class="' + (r.sh === TARGET ? 'today' : '') + '" onclick="showChart(\'' + r.rc + '\')">'
+        return '<tr class="' + (r.sh === TARGET ? 'today' : '') + '" onclick="openRow(\'' + r.rc + '\')">'
              + COLS.map(function (col) { return cellHtml(col, r); }).join('') + '</tr>';
       }).join('')
     : '<tr><td colspan="' + COLS.length + '">該当なし（フィルタを外すと ' + ROWS.length + ' 件）</td></tr>';
@@ -842,7 +1166,7 @@ function fillSelect(id, values, allLabel) {
   const el = document.getElementById(id);
   if (!el) return;
   el.innerHTML = '<option value="">' + allLabel + '</option>'
-    + values.map(function (v) { return '<option value="' + v + '">' + v + '</option>'; }).join('');
+    + values.map(function (v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('');
 }
 (function init() {
   const mkts = [], mcls = [];
@@ -875,6 +1199,18 @@ function fillSelect(id, values, allLabel) {
 </script>"""
 
 
+def _json_script(obj: Any) -> str:
+    """<script> の中に置くJSON。`</script>` でスクリプトが閉じないようエスケープする。
+
+    社名はAPI由来だが、材料メモは手入力の自由記述なので実際に起こりうる。
+    JSON としては \\u003c 等がそのまま元の文字に戻るので、意味は変わらない。
+    """
+    return (json.dumps(obj, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
 def _row_payload(r: Dict[str, Any]) -> Dict[str, Any]:
     """層Aの1行ぶん。キーは短縮名（HTMLの肥大を抑える）。"""
     return {"rc": r["raw_code"], "c": r["code"], "n": r.get("name", ""),
@@ -904,10 +1240,11 @@ def render(target: str, records: List[Dict[str, Any]], crit: Optional[Dict[str, 
     with open(os.path.join(docs, "data", "latest.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
 
-    rows_js = json.dumps([_row_payload(r) for r in records], ensure_ascii=False)
+    rows_js = _json_script([_row_payload(r) for r in records])
     chart_map = {r["raw_code"]: {"name": r["name"], "code": r["code"],
-                                 "chart": r.get("chart", [])} for r in records}
-    data_js = json.dumps(chart_map, ensure_ascii=False)
+                                 "chart": r.get("chart", []),
+                                 "card": r.get("card", {})} for r in records}
+    data_js = _json_script(chart_map)
     today_sh = sum(1 for r in records if r.get("sh_date") == target)
     gate = bool(crit.get("dip_default_filter"))
     band = list(crit.get("dip_dd_band") or DEFAULT_CRITERIA["dip_dd_band"])
@@ -940,6 +1277,16 @@ tbody tr{{cursor:pointer}} tbody tr:hover{{background:#21262d}}
 td.num{{text-align:right}} td.warn{{color:#f85149}} td.na{{color:#6e7681}}
 tr.today{{background:#13301f}}
 .dry-low{{color:#3fb950}} .earn-near{{color:#f0a020}}
+#card{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-bottom:12px;font-size:12px}}
+#card section{{border:1px solid #30363d;border-radius:6px;padding:8px 10px;background:#0d1117;min-width:0}}
+#card h3{{font-size:12px;margin:0 0 6px;color:#8b949e;font-weight:600}}
+#card .kv{{display:flex;justify-content:space-between;gap:8px;line-height:1.8;border-bottom:1px dotted #21262d}}
+#card .kv:last-child{{border-bottom:0}} #card .kv b{{font-weight:600}}
+#card .muted{{color:#6e7681}} #card .warn{{color:#f85149}} #card .good{{color:#3fb950}}
+#card .body{{white-space:pre-wrap;line-height:1.7}}
+#card table{{font-size:11px;width:100%}} #card th,#card td{{padding:2px 4px}}
+#card .ref{{color:#6e7681;font-size:11px;margin-top:6px;line-height:1.6}}
+#card .vwrap{{position:relative;height:110px}}
 #filters{{margin:10px 0;padding:8px 10px;border:1px solid #30363d;border-radius:8px;background:#0f141b;font-size:12px;color:#8b949e}}
 #filters label{{margin-right:14px;display:inline-block;line-height:2}}
 #filters input,#filters select{{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:2px 5px;font-size:12px}}
@@ -963,6 +1310,7 @@ tr.today{{background:#13301f}}
 <div id="panel">
   <span class="close" onclick="document.getElementById('panel').style.display='none'">閉じる ✕</span>
   <h2 id="ptitle"></h2>
+  <div id="card"></div>
   <div id="tfbtns"><button id="btf-d" onclick="setTf('d')">日足</button><button id="btf-w" onclick="setTf('w')">週足</button></div>
   <div class="cwrap"><canvas id="cPrice"></canvas></div>
   <div class="cwrap small"><canvas id="cMacd"></canvas></div>
@@ -994,6 +1342,10 @@ tr.today{{background:#13301f}}
 {gate_note}
 本体 kabu-monitor では「直近で最も上げた順」に並べた指標がのちに逆相関と判明した例（M2≥95 で -2.21%）があり、
 <b>枯れ比・下落率にも同じ罠がありうる【推測】</b>。検証を通すまでは表示のみで、抽出条件・並び順の根拠には使わない。<br>
+<b>行をクリック</b>すると、チャートの上に銘柄カードが開く。カードにはチャートで見えない情報だけを置いた
+（材料・材料分類・継続性＝手入力／決算日／信用買残3週と信用倍率／買残÷浮動株／S高日=100の出来高推移／
+下落日と反発日の平均出来高／位置要約／同業種の当日上昇本数／過去2年のS高エピソード）。
+<b>信用倍率＝買残÷売残で、日証金の貸借倍率とは別物</b>（日証金分はJ-Quants非配信）。<br>
 「{NA}」はデータ取得不可・算出不能、「{MATERIAL_UNSET}」は手入力待ち。材料の中身はJ-Quants非配信のためTDnet/EDINETで確認すること。<br>
 本表は手法に基づく機械的抽出であり投資助言ではない。最終判断は自己責任。
 </div>
@@ -1109,7 +1461,7 @@ def main() -> int:
     records, failed = [], []
     for i, item in enumerate(shortlist, 1):
         try:
-            rec = analyze_candidate(jq, item, names, mkt, crit, sec, ecal)
+            rec = analyze_candidate(jq, item, names, mkt, crit, sec, ecal, chg_all)
             records.append(rec)
             dd = f"{rec['dd_pct']:+.1f}%" if rec["dd_pct"] is not None else NA
             dry = f"{rec['dry_pct']:.0f}%" if rec["dry_pct"] is not None else NA
